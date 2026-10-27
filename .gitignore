@@ -241,3 +241,9 @@ poetry.toml
 
 # LSP config files
 pyrightconfig.json
+
+### Project ###
+firmware/build_*/
+# EC dumps are proprietary firmware: keep them out of the repo
+*.bin
+*.uf2

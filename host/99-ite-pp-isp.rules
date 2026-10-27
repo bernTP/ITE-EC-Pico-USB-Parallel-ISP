@@ -1,0 +1,3 @@
+# Pico running the ite_pp_isp firmware: allow plugdev users and the
+# logged-in user to open it with pyusb.
+SUBSYSTEM=="usb", ATTR{idVendor}=="1209", ATTR{idProduct}=="0001", MODE="0660", GROUP="plugdev", TAG+="uaccess"

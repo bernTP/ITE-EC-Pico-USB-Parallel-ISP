@@ -19,3 +19,15 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+-------------------------------------------------------------------------------
+Third-party work this project is based on
+-------------------------------------------------------------------------------
+
+- I2C-Pico-USB-ITE-EC-prog, Copyright (c) 2026 JohnDoe150489, MIT License.
+  https://github.com/JohnDoe150489/I2C-Pico-USB-ITE-EC-prog
+- I2C-Pico-USB, Copyright (c) 2024 Daniel Quadros, MIT License
+  (USB descriptor and TinyUSB configuration structure).
+- Chromium OS EC util/iteflash.cc, Copyright 2013 The ChromiumOS Authors,
+  BSD-style license (DBGR register sequences: chip ID, follow mode,
+  fast read, watchdog, exit). https://chromium.googlesource.com/chromiumos/platform/ec

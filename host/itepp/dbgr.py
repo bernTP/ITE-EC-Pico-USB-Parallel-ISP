@@ -1,0 +1,145 @@
+"""ITE DBGR register access over EPP.
+
+Ported from Chromium EC util/iteflash.cc and iteflash-i2cpicousb.py.
+Over I2C, DBGR uses a command address (0x5A: select register) and a
+data address (0x35: read/write it). Over EPP the same roles map to the
+address cycle and the data cycle.
+"""
+
+from .proto import Batch
+
+# EC memory window (D2EC): 0x2F = address high, 0x2E = address low,
+# 0x30 = data, 0x80 = address bits 23..16 on chips with 3-byte addressing
+REG_MEM_BANK = 0x80
+REG_MEM_HI = 0x2F
+REG_MEM_LO = 0x2E
+REG_MEM_DATA = 0x30
+REG_CPU = 0x27
+
+V2_SIZES_KB = [128, 192, 256, 384, 512, 0, 1024]
+IT5XXXX_SIZES_KB = {0x01: 128, 0x02: 256, 0x0E: 512, 0x0F: 1024}
+
+
+class DetectError(Exception):
+    pass
+
+
+class ChipInfo:
+    def __init__(self):
+        self.chip_id = 0
+        self.ver = 0
+        self.flash_size = 0
+        self.flash_cmd_v2 = False
+        self.addr_3bytes = False
+        self.it5xxxx = False
+        self.instruction_set_v2 = False
+        self.deep_rescue = False
+        self.size_code = None
+
+    def __str__(self):
+        s = (f'CHIPID {self.chip_id:05x}, CHIPVER {self.ver:02x}, '
+             f'Flash size {self.flash_size // 1024} kB')
+        if self.it5xxxx:
+            s += f' (IT5xxxx, size code {self.size_code:#04x})'
+        return s
+
+
+class Dbgr:
+    def __init__(self, link):
+        self.link = link
+        self.info = ChipInfo()
+
+    # ─── Primitives ─────────────────────────────────────────────────
+    def write_regs(self, pairs):
+        self.link.run(Batch().reg_writes(pairs))
+
+    def read_regs(self, regs):
+        b = Batch()
+        for r in regs:
+            b.reg_read(r)
+        return list(self.link.run(b).data)
+
+    def _mem_select(self, b, addr, bank):
+        if bank:
+            b.reg_write(REG_MEM_BANK, (addr >> 16) & 0xFF)
+        b.reg_write(REG_MEM_HI, (addr >> 8) & 0xFF)
+        b.reg_write(REG_MEM_LO, addr & 0xFF)
+
+    def ec_read(self, addr, bank=None):
+        """Read one byte of EC memory / registers through DBGR."""
+        if bank is None:
+            bank = self.info.addr_3bytes or addr > 0xFFFF
+        b = Batch()
+        self._mem_select(b, addr, bank)
+        b.reg_read(REG_MEM_DATA)
+        return self.link.run(b).data[0]
+
+    def ec_write(self, addr, val, bank=None):
+        """Write one byte of EC memory / registers (never flash)."""
+        if bank is None:
+            bank = self.info.addr_3bytes or addr > 0xFFFF
+        b = Batch()
+        self._mem_select(b, addr, bank)
+        b.reg_write(REG_MEM_DATA, val)
+        self.link.run(b)
+
+    def _ec_addr(self, addr16):
+        """EC register address as iteflash.cc builds it (bank 0xF0 if 3-byte)."""
+        return (0xF00000 | addr16) if self.info.addr_3bytes else addr16
+
+    # ─── Chip identification (check_chipid) ─────────────────────────
+    def detect(self, halt=True):
+        info = ChipInfo()
+        self.info = info
+        hi, lo, ver = self.read_regs([0x00, 0x01, 0x02])
+        cid = (hi << 8) | lo
+        info.ver = ver
+
+        if (cid & 0xFF00) != 0x8300:
+            cid |= self.ec_read(0xF02085, bank=True) << 16
+            # Boot ROM deep-rescue mode: core clock domain gated
+            if (cid & 0xFF00F) in (0x01002, 0x02002):
+                cid |= 0x80000
+                info.deep_rescue = True
+            if (cid & 0xF000F) in (0x80001, 0x80002):
+                info.flash_cmd_v2 = True
+                info.addr_3bytes = True
+                info.instruction_set_v2 = (cid & 0xF00F) == 0x2002
+            elif (cid & 0xF0000) == 0x50000:
+                if halt:
+                    # reset and halt the EC CPU so it stays off the flash
+                    self.write_regs([(REG_CPU, 0x81)])
+                info.it5xxxx = True
+                info.flash_cmd_v2 = True
+                info.addr_3bytes = True
+                info.size_code = self.ec_read(0xF01080, bank=True)
+            else:
+                info.chip_id = cid
+                raise DetectError(f'invalid chip id {cid:05x} '
+                                  f'(raw regs 00..02 = {hi:02x} {lo:02x} {ver:02x})')
+        else:
+            info.flash_cmd_v2 = (ver & 0x0F) >= 0x03
+
+        info.chip_id = cid
+        if info.it5xxxx:
+            info.flash_size = IT5XXXX_SIZES_KB.get(info.size_code & 0x0F, 0) * 1024
+        elif info.flash_cmd_v2:
+            i = (ver & 0xF0) >> 5
+            info.flash_size = (V2_SIZES_KB[i] if i < len(V2_SIZES_KB) else 0) * 1024
+        else:
+            info.flash_size = (128 + (ver & 0xF0)) * 1024
+        if info.flash_size == 0:
+            raise DetectError(f'invalid flash size ({info})')
+        return info
+
+    # ─── Optional EC register writes (not flash) ────────────────────
+    def disable_watchdog(self):
+        """ETWCFG: stop the EC watchdog (PP mode already does it in hardware)."""
+        reg = 0x1F85 if self.info.instruction_set_v2 else 0x1F05
+        self.ec_write(self._ec_addr(reg), 0x30, bank=self.info.addr_3bytes)
+
+    def reset_gpio(self):
+        self.ec_write(self._ec_addr(0x2007), 0x02, bank=self.info.addr_3bytes)
+
+    def exit(self):
+        self.ec_write(self._ec_addr(0x1C08), 0x10, bank=self.info.addr_3bytes)
