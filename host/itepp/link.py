@@ -80,7 +80,7 @@ class UsbLink(BaseLink):
             raise LinkError('libusb not found: sudo apt install libusb-1.0-0') from e
         if dev is None:
             raise LinkError(
-                f'Pico ISP adapter not found (VID={vid:#06x} PID={pid:#06x}). '
+                f'Pico not found (VID={vid:#06x} PID={pid:#06x}). '
                 'Check the USB cable, `lsusb`, and that the ite_pp_isp '
                 'firmware is flashed.')
         self.dev = dev

@@ -2,8 +2,9 @@
 
 import hashlib
 
-# 8051 ITE EC images carry a run of 0xA5 bytes in their signature block
-ITE_SIGNATURE = b'\xA5' * 7
+# ITE EC images carry a run of 0xA5 bytes in their signature block
+# (IT5261 at 0x80: A5 A5 A5 A5 A5 A5 A7 14 85 12 ..., then the image name)
+ITE_SIGNATURE = b'\xA5' * 6
 
 
 def dump(eflash, base, size, passes=2, read_reg=0x09, chunk=4096,

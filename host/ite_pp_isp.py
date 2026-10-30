@@ -2,16 +2,14 @@
 """ite_pp_isp.py: read an ITE EC e-flash through the keyboard connector.
 
 Parallel ISP (ITE DBGR over IEEE 1284 EPP on the KSI/KSO pins), using a
-Raspberry Pi Pico running firmware/ as the adapter. Read-only: no erase
+Raspberry Pi Pico running firmware/ in between. Read-only: no erase
 or program command is ever sent to the flash.
 
-Typical session:
+Typical session (AC unplugged at the start):
     ./ite_pp_isp.py hello
-    ./ite_pp_isp.py lines
-    ./ite_pp_isp.py enter --mode hotplug      (or --mode powerup)
-    ./ite_pp_isp.py probe
+    ./ite_pp_isp.py enter --mode powerup      (asks when to plug AC in)
     ./ite_pp_isp.py id
-    ./ite_pp_isp.py read -o dump.bin
+    ./ite_pp_isp.py read -o dump.bin --no-exit
 """
 
 import argparse
@@ -22,7 +20,8 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from itepp import diag, proto                              # noqa: E402
-from itepp.dbgr import Dbgr, DetectError                   # noqa: E402
+from itepp.dbgr import (Dbgr, BusError, DetectError,      # noqa: E402
+                        bus_report)
 from itepp.dump import analyze, dump                       # noqa: E402
 from itepp.epp import EppConfig                            # noqa: E402
 from itepp.flash import Eflash, FlashError                 # noqa: E402
@@ -34,11 +33,12 @@ PAGE = 256
 
 TROUBLE = """\
 No answer from the EC. Things to check:
-  - `lines`: are the 15 lines connected, is the EC powered (lines high or toggling)?
+  - wiring: with the board unpowered, `lines` must show connected lines low
+    with the pull-up (the EC clamps them); a line reading high is not connected
   - common GND between the Pico and the laptop board
   - FFC pin order mirrored? (connector orientation)
-  - enter again: `enter --mode hotplug`, or power the board off and use
-    `enter --mode powerup` (EC firmware may block hot-plug)
+  - entry: unplug AC and use `enter --mode powerup`. KSI1/KSI2 must be on
+    pull-ups when AC goes in; hot-plug entry is blocked on some boards
   - `probe` tries other handshake / strobe settings"""
 
 
@@ -57,59 +57,52 @@ def connect(args):
     if args.sim:
         with open(args.sim, 'rb') as f:
             ec = SimEC(f.read())
-        link = SimLink(ec, hotplug=not args.sim_powerup, dead=args.sim_dead)
+        link = SimLink(ec, hotplug=not args.sim_powerup, dead=args.sim_dead,
+                       stuck=args.sim_stuck)
     else:
         link = UsbLink(timeout_ms=args.usb_timeout)
     info = link.hello()
     if args.verbose:
-        print(f'adapter: firmware {info["fw"]}, protocol v{info["proto"]}')
+        print(f'Pico: firmware {info["fw"]}, protocol v{info["proto"]}')
     epp_config(args).apply(link)
     if args.enter != 'none':
-        enter(link, args.enter, args.wait_s, interactive=not args.sim)
+        enter(link, args.enter, interactive=not args.sim)
     return link
 
 
-def pins(link):
-    return link.run(Batch().pins_get()).u16()
+KSI0_3 = 0x0F << proto.LINE_STB
+KSI4_5 = (1 << proto.LINE_KSI4) | (1 << proto.LINE_KSI5)
 
 
-def stdin_ready():
+def ask(text):
     try:
-        import select
-        return bool(select.select([sys.stdin], [], [], 0)[0])
-    except (ImportError, OSError, ValueError):
-        return False
+        input(f'>>> {text} [Enter] ')
+    except EOFError:
+        raise SystemExit('no input: stopped (lines left as they are)')
 
 
-def enter(link, mode, wait_s=120, interactive=True):
+def enter(link, mode, interactive=True):
     """Apply KSI[5,4,2,1] = 0011b so the EC enters DBGR/EPP."""
     if mode == 'hotplug':
         link.run(Batch().strap(proto.STRAP_DRIVE).delay_us(100000))
         print('Strap driven (KSI4/KSI5 low, STB#/AFD#/INIT#/SLIN# high).')
         return
 
-    # powerup: KSI4/5 low, highs only through pull-ups until VSTBY is there
-    link.run(Batch().strap(proto.STRAP_WEAK).delay_us(20000))
-    print('Strap applied weakly (KSI4/KSI5 low, control lines pulled up).')
+    # powerup: the EC latches the strap once, at VSTBY power-up, and only from
+    # pulls (pulled up = 1, pulled down or floating = 0, driven = unknown).
+    # 1. drain: released RP2350 pins leak enough to keep an unpowered EC half
+    #    alive, so every line is driven low while it discharges
+    link.run(Batch().pulls(0, 0).pins_set(proto.LINES_MASK, 0))
     if interactive:
-        watch = proto.LINES_MASK & ~((1 << proto.LINE_KSI4) | (1 << proto.LINE_KSI5))
-        before = pins(link)
-        print('Now plug in the AC adapter (battery disconnected).')
-        print(f'Waiting up to {wait_s}s for the EC to power up '
-              '(press Enter to continue without detection)...')
-        t0 = time.time()
-        while True:
-            now = pins(link)
-            if (now ^ before) & watch:
-                print(f'Line change detected ({before:04x} -> {now:04x}).')
-                break
-            if stdin_ready():
-                sys.stdin.readline()
-                break
-            if time.time() - t0 > wait_s:
-                raise SystemExit('No power-up detected. Run `lines` to check the wiring.')
-            time.sleep(0.05)
-        time.sleep(0.5)
+        print('AC must be UNPLUGGED (battery out). All lines are driven low so the EC')
+        print('discharges. Wait until it is fully off: an unused keyboard pin such as')
+        print('FFC pin 21 near 0 V on a meter, or a few minutes.')
+        ask('Press Enter, then plug in AC straight away')
+    # 2. pattern: KSI4/KSI5 low, pull-ups on KSI0-3 only, the rest released
+    link.run(Batch().safe(proto.PULL_NONE).pulls(KSI0_3, 0).pins_set(KSI4_5, 0))
+    if interactive:
+        print('Pattern applied (KSI4/KSI5 low, pull-ups on KSI0-KSI3). PLUG IN AC NOW.')
+        ask('Press Enter once AC is in')
     link.run(Batch().strap(proto.STRAP_DRIVE).delay_us(100000))
     print('Strap now driven.')
 
@@ -132,7 +125,7 @@ def progress_printer():
 
 def cmd_hello(link, args):
     info = link.hello()
-    print(f'Pico adapter OK: firmware {info["fw"]}, protocol v{info["proto"]}, '
+    print(f'Pico OK: firmware {info["fw"]}, protocol v{info["proto"]}, '
           f'{info["lines"]} lines')
 
 
@@ -150,12 +143,17 @@ def cmd_lines(link, args):
 
 def cmd_enter(link, args):
     if args.enter == 'none':
-        enter(link, args.mode, args.wait_s, interactive=not args.sim)
+        enter(link, args.mode, interactive=not args.sim)
+    try:
+        print(bus_report(*Dbgr(link).check_bus()))
+    except OpError as e:
+        print(f'First EPP access: {e.result.status_name}. Try `probe`.')
+        return 1
     res = link.run(Batch().reg_read(0).reg_read(1).reg_read(2), check=False)
     if res.ok:
-        print(f'DBGR regs 00..02: {res.data.hex(" ")}')
+        print(f'DBGR regs 00..02: {res.data.hex(" ")}  (IT5261: 52 61 02)')
     else:
-        print(f'First EPP access: {res.status_name}. Try `probe`.')
+        print(f'DBGR regs 00..02: {res.status_name}. Try `probe`.')
 
 
 def cmd_probe(link, args):
@@ -191,6 +189,9 @@ def detect(link, args):
     dbgr = Dbgr(link)
     try:
         info = dbgr.detect(halt=not args.no_halt)
+    except BusError as e:
+        # never continue: register numbers would be corrupted
+        raise SystemExit(f'error: {e}')
     except DetectError as e:
         if not getattr(args, 'size', 0):
             print(f'Chip detection failed: {e}', file=sys.stderr)
@@ -284,7 +285,7 @@ def cmd_read(link, args):
 def build_parser():
     p = argparse.ArgumentParser(
         description='Read an ITE EC e-flash over the keyboard connector '
-                    '(parallel ISP / DBGR over EPP) with a Pico adapter. Read-only.',
+                    '(parallel ISP / DBGR over EPP) with a Raspberry Pi Pico. Read-only.',
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=TROUBLE)
 
     g = p.add_argument_group('EPP tuning (any command)')
@@ -305,18 +306,17 @@ def build_parser():
     g = p.add_argument_group('general')
     g.add_argument('--enter', choices=['none', 'hotplug', 'powerup'], default='none',
                    help='apply the entry strap before the command')
-    g.add_argument('--wait-s', type=int, default=120,
-                   help='power-up wait for --enter powerup')
     g.add_argument('--usb-timeout', type=int, default=2000, metavar='MS')
     g.add_argument('-v', '--verbose', action='store_true')
     g.add_argument('--sim', metavar='BIN', help='simulate an EC holding BIN (no hardware)')
     g.add_argument('--sim-powerup', action='store_true', help=argparse.SUPPRESS)
     g.add_argument('--sim-dead', action='store_true', help=argparse.SUPPRESS)
+    g.add_argument('--sim-stuck', type=lambda x: int(x, 16), default=0, help=argparse.SUPPRESS)
 
     sub = p.add_subparsers(dest='cmd', metavar='command')
     sub.required = True
 
-    s = sub.add_parser('hello', help='check the Pico adapter')
+    s = sub.add_parser('hello', help='check that the Pico answers')
     s.set_defaults(func=cmd_hello)
 
     s = sub.add_parser('safe', help='release all lines (Hi-Z)')
@@ -328,7 +328,9 @@ def build_parser():
     s.set_defaults(func=cmd_lines)
 
     s = sub.add_parser('enter', help='apply the DBGR/EPP entry strap')
-    s.add_argument('--mode', choices=['hotplug', 'powerup'], default='hotplug')
+    s.add_argument('--mode', choices=['hotplug', 'powerup'], default='powerup',
+                   help='powerup (default): AC unplugged first, the tool says when to '
+                        'plug it in. hotplug: board already powered')
     s.set_defaults(func=cmd_enter)
 
     s = sub.add_parser('probe', help='try EPP settings, report which one answers')

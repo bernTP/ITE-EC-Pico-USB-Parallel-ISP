@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(HERE))
 
 import ite_pp_isp                                   # noqa: E402
 from itepp import diag, proto                       # noqa: E402
-from itepp.dbgr import Dbgr, DetectError            # noqa: E402
+from itepp.dbgr import BusError, Dbgr, DetectError  # noqa: E402
 from itepp.dump import analyze, dump                # noqa: E402
 from itepp.epp import EppConfig                     # noqa: E402
 from itepp.flash import Eflash                      # noqa: E402
@@ -74,6 +74,29 @@ class ChipTest(unittest.TestCase):
         self.assertTrue(info.it5xxxx)
         self.assertEqual(info.flash_size, 256 * 1024)
         self.assertTrue(link.ec.halted)
+
+    def test_detect_it5261_real_id3(self):
+        # the real chip reads 52 61 02 with 0x00 as 3rd ID byte
+        link = armed_link(image(256 * 1024), id3=0x00, ver=0x02)
+        info = Dbgr(link).detect()
+        self.assertEqual(info.chip_id, 0x05261)
+        self.assertTrue(info.it5xxxx)
+        self.assertEqual(info.flash_size, 256 * 1024)
+        self.assertTrue(link.ec.halted)
+
+    def test_bus_check(self):
+        link = armed_link(image(1024))
+        self.assertEqual(Dbgr(link).check_bus(), (0, 0))
+
+    def test_stuck_bits_stop_before_any_write(self):
+        link = armed_link(image(256 * 1024))
+        link.stuck = 0x06                   # KSO1/KSO2 taken as GPIO
+        self.assertEqual(Dbgr(link).check_bus(), (0x06, 0))
+        with self.assertRaises(BusError) as cm:
+            Dbgr(link).detect()
+        self.assertIn('PD1 (FFC pin 13) stuck at 1', str(cm.exception))
+        self.assertFalse(link.ec.halted)
+        self.assertEqual(link.ec.ec_writes, [])
 
     def test_detect_no_halt(self):
         link = armed_link(image(256 * 1024))
@@ -170,6 +193,11 @@ class AnalyzeTest(unittest.TestCase):
     def test_signature(self):
         self.assertTrue(any('signature found at 0x000080' in n for n in analyze(image(4096))))
 
+    def test_signature_it5261(self):
+        data = bytearray(image(4096))
+        data[0x80:0x90] = bytes.fromhex('a5a5a5a5a5a5a7148512763' '2aa005555')
+        self.assertTrue(any('signature found at 0x000080' in n for n in analyze(bytes(data))))
+
 
 class DiagTest(unittest.TestCase):
     def test_probe_prefers_working(self):
@@ -199,6 +227,10 @@ class DiagTest(unittest.TestCase):
         self.assertIn('dr 1: 52', out)
         self.assertIn('dr 1: 61', out)
         self.assertIn('status OK', out)
+
+    def test_address_read_is_complement(self):
+        link = armed_link(image(1024))
+        self.assertEqual(link.run(Batch().aw(0x5A).ar().aw(0x00).ar()).data, b'\xa5\xff')
 
     def test_lines(self):
         link = SimLink(SimEC(image(1024)))
@@ -242,6 +274,19 @@ class CliTest(unittest.TestCase):
         rc, out, err = self.cli('--sim-powerup', '--enter', 'powerup', 'id')
         self.assertEqual(rc, 0, out + err)
         self.assertIn('CHIPID 55261', out)
+
+    def test_enter_reports_bus(self):
+        rc, out, err = self.cli('--enter', 'hotplug', 'enter')
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn('Address echo OK', out)
+        self.assertIn('DBGR regs 00..02: 52 61 00', out)
+
+    def test_stuck_bits_abort_even_with_size(self):
+        dst = os.path.join(self.tmp.name, 'out.bin')
+        with self.assertRaises(SystemExit) as cm:
+            self.cli('--sim-stuck', '06', '--enter', 'hotplug', 'read', '-o', dst, '-s', '256')
+        self.assertIn('stuck at 1', str(cm.exception))
+        self.assertFalse(os.path.exists(dst))
 
     def test_hotplug_blocked(self):
         rc, out, err = self.cli('--sim-powerup', '--enter', 'hotplug', 'id')

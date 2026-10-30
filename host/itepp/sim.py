@@ -1,8 +1,9 @@
 """Simulated Pico + ITE EC, for tests and dry runs without hardware.
 
-SimLink parses batches exactly like firmware/main.c. SimEC models the
-H1 hypothesis: EPP address cycle = DBGR register index, data cycle =
-register value, with the follow-mode SPI path of iteflash.c behind it.
+SimLink parses batches exactly like firmware/main.c. SimEC models what an
+IT5261 does: EPP address cycle = DBGR register index, data cycle =
+register value, address read = complement of the address, with the
+follow-mode SPI path of iteflash.c behind it.
 """
 
 import struct
@@ -43,7 +44,7 @@ class SimEC:
         self.addr = v
 
     def addr_read(self):
-        return self.addr
+        return ~self.addr & 0xFF
 
     def data_write(self, v):
         r = self.addr
@@ -123,18 +124,33 @@ class SimLink(BaseLink):
     """Executes batches like the firmware, against a SimEC.
 
     hotplug: EC enters DBGR/EPP when the strap is driven while powered.
+             Otherwise only the power-up pattern enters it: KSI1/KSI2 on
+             pull-ups and KSI4/KSI5 driven low (AC plugged in between).
     dead:    EC never answers (nWait timeouts), like a wrong wiring.
+    stuck:   data bits the EC neither drives nor receives (KBS pins taken
+             as GPIO by its firmware): they read 1 and arrive as 1.
     """
 
-    def __init__(self, ec, hotplug=True, dead=False, nwait_inv=False):
+    def __init__(self, ec, hotplug=True, dead=False, nwait_inv=False, stuck=0):
         self.ec = ec
         self.hotplug = hotplug
         self.dead = dead
         self.sim_nwait_inv = nwait_inv
+        self.stuck = stuck
         self.armed = False
         self.entered = False
         self.flags = proto.CFG_HANDSHAKE
         self.pins = 0
+        self.oe = 0
+        self.val = 0
+        self.up = 0
+
+    def _check_powerup_pattern(self):
+        ksi12 = (1 << proto.LINE_AFD) | (1 << proto.LINE_INIT)
+        ksi45 = (1 << proto.LINE_KSI4) | (1 << proto.LINE_KSI5)
+        if (self.up & ksi12 == ksi12 and not self.oe & ksi12
+                and self.oe & ksi45 == ksi45 and not self.val & ksi45):
+            self.entered = True
 
     def _epp_ok(self):
         if self.dead or not self.entered:
@@ -155,9 +171,10 @@ class SimLink(BaseLink):
         if self.flags & proto.CFG_SWAP_STROBE:
             addr = not addr
         if write:
-            (self.ec.addr_write if addr else self.ec.data_write)(val)
+            (self.ec.addr_write if addr else self.ec.data_write)(val | self.stuck)
             return proto.ST_OK, 0
-        return proto.ST_OK, (self.ec.addr_read() if addr else self.ec.data_read())
+        v = self.ec.addr_read() if addr else self.ec.data_read()
+        return proto.ST_OK, v | self.stuck
 
     def transact(self, payload, expect):
         if payload[0] != proto.REQ_MAGIC:
@@ -192,6 +209,8 @@ class SimLink(BaseLink):
                     break
                 if run:
                     self.armed = False
+                    self.oe = 0
+                    self.up = proto.LINES_MASK if p[i] == proto.PULL_UP else 0
                 i += 1
             elif op == proto.OP_STRAP:
                 if not need(1):
@@ -206,6 +225,13 @@ class SimLink(BaseLink):
                 if not need(4):
                     status, fail = proto.ST_BAD_OP, idx
                     break
+                if run:
+                    a, b = struct.unpack_from('<HH', p, i)
+                    if op == proto.OP_PINS_SET:
+                        self.oe, self.val = a & proto.LINES_MASK, b
+                    else:
+                        self.up = a
+                    self._check_powerup_pattern()
                 i += 4
             elif op == proto.OP_PINS_GET:
                 # powered EC: everything idles high, nWait low (ready)

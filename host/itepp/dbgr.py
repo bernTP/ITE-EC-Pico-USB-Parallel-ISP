@@ -3,9 +3,13 @@
 Ported from Chromium EC util/iteflash.cc and iteflash-i2cpicousb.py.
 Over I2C, DBGR uses a command address (0x5A: select register) and a
 data address (0x35: read/write it). Over EPP the same roles map to the
-address cycle and the data cycle.
+address cycle and the data cycle (confirmed on an IT5261).
+
+An EPP address read returns the complement of the last address written,
+which tests all 8 data lines in both directions without touching a register.
 """
 
+from . import proto
 from .proto import Batch
 
 # EC memory window (D2EC): 0x2F = address high, 0x2E = address low,
@@ -19,9 +23,28 @@ REG_CPU = 0x27
 V2_SIZES_KB = [128, 192, 256, 384, 512, 0, 1024]
 IT5XXXX_SIZES_KB = {0x01: 128, 0x02: 256, 0x0E: 512, 0x0F: 1024}
 
+# Address echo patterns: every data bit is seen at 0 and at 1
+ECHO_PATTERNS = (0x00, 0xFF, 0x55, 0xAA)
+
 
 class DetectError(Exception):
     pass
+
+
+class BusError(DetectError):
+    """Some data bits don't answer: register numbers would be corrupted."""
+
+
+def bus_report(stuck_high, stuck_low):
+    """Text for the result of Dbgr.check_bus()."""
+    if not (stuck_high or stuck_low):
+        return 'Address echo OK: all 8 data bits answer.'
+    parts = []
+    for mask, level in ((stuck_high, 1), (stuck_low, 0)):
+        for bit in range(8):
+            if mask >> bit & 1:
+                parts.append(f'PD{bit} (FFC pin {proto.LINE_FFC[bit]}) stuck at {level}')
+    return 'Address echo FAILED: ' + ', '.join(parts)
 
 
 class ChipInfo:
@@ -59,6 +82,23 @@ class Dbgr:
             b.reg_read(r)
         return list(self.link.run(b).data)
 
+    def check_bus(self):
+        """Address-write/read echo. Returns (stuck_high, stuck_low) bit masks.
+
+        The EC firmware can switch KBS pins to GPIO, which overrides EPP
+        (seen on KSO1/KSO2 of an IT5261): those bits then read 1 and are
+        received as 1, so register numbers get corrupted."""
+        b = Batch()
+        for v in ECHO_PATTERNS:
+            b.aw(v).ar()
+        got = self.link.run(b).data
+        stuck_high = stuck_low = 0
+        for v, r in zip(ECHO_PATTERNS, got):
+            want = ~v & 0xFF
+            stuck_high |= r & ~want
+            stuck_low |= want & ~r
+        return stuck_high & 0xFF, stuck_low & 0xFF
+
     def _mem_select(self, b, addr, bank):
         if bank:
             b.reg_write(REG_MEM_BANK, (addr >> 16) & 0xFF)
@@ -91,6 +131,11 @@ class Dbgr:
     def detect(self, halt=True):
         info = ChipInfo()
         self.info = info
+        # before any register write: a stuck bit would send it elsewhere
+        stuck = self.check_bus()
+        if any(stuck):
+            raise BusError(bus_report(*stuck) + '. The EC firmware may hold these pins as '
+                           'GPIO: power-cycle and run `enter --mode powerup` again.')
         hi, lo, ver = self.read_regs([0x00, 0x01, 0x02])
         cid = (hi << 8) | lo
         info.ver = ver
@@ -105,7 +150,9 @@ class Dbgr:
                 info.flash_cmd_v2 = True
                 info.addr_3bytes = True
                 info.instruction_set_v2 = (cid & 0xF00F) == 0x2002
-            elif (cid & 0xF0000) == 0x50000:
+            # iteflash expects 0x5 in the 3rd byte; an IT5261 reads 52 61 02
+            # with 0x00 there, but its size code is at the IT5xxxx address
+            elif (cid & 0xF0000) == 0x50000 or (cid & 0xF000) == 0x5000:
                 if halt:
                     # reset and halt the EC CPU so it stays off the flash
                     self.write_regs([(REG_CPU, 0x81)])
