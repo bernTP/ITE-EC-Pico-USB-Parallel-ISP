@@ -17,9 +17,14 @@ WRITE_OPCODES = {0x01, 0x02, 0x06, 0x20, 0x50, 0x60, 0xAD, 0xD7, 0xD8, 0xC7}
 
 
 class SimEC:
+    """prog_us / erase_us: how long a word program / sector erase keeps the
+    status BUSY bit set, on the clock that SimLink advances (1 us per EPP
+    cycle plus delay ops). write_protect: WREN is ignored."""
+
     def __init__(self, flash, chip=(0x52, 0x61), id3=0x05, ver=0x00,
-                 size_code=None):
-        self.flash = bytes(flash)
+                 size_code=None, prog_us=0, erase_us=0, write_protect=False,
+                 erase_blocked=False, busy_reads_ff=False, aai_status_ff=False):
+        self.flash = bytearray(flash)
         self.regs = bytearray(256)
         self.regs[0], self.regs[1], self.regs[2] = chip[0], chip[1], ver
         if size_code is None:
@@ -38,6 +43,18 @@ class SimEC:
         self.halted = False
         self.dangerous = []     # write/erase SPI opcodes seen
         self.ec_writes = []     # (address, value) EC memory writes
+        self.prog_us = prog_us
+        self.erase_us = erase_us
+        self.write_protect = write_protect
+        self.erase_blocked = erase_blocked  # erase ignored, then SPI reads all FF
+        self.dead_spi = False
+        self.busy_reads_ff = busy_reads_ff  # status reads ff while busy
+        self.aai_status_ff = aai_status_ff  # status reads ff during AAI (IT5261)
+        self.now_us = 0
+        self.busy_until = 0
+        self.wel = False
+        self.aai_addr = None    # next AAI word address while in AAI mode
+        self.erased = []        # sector addresses, in erase order
 
     # ─── EPP cycles ─────────────────────────────────────────────────
     def addr_write(self, v):
@@ -89,6 +106,8 @@ class SimEC:
         if not self._follow():
             return
         if self.ecindar[1] == 0xFE:
+            if self.cs:
+                self._spi_end()
             self.cs = False
         elif self.ecindar[1] == 0xFD:
             if not self.cs:
@@ -101,8 +120,42 @@ class SimEC:
             else:
                 self.spi_in.append(v)
 
+    def _busy(self):
+        return self.now_us < self.busy_until
+
+    def _program(self, a, data):
+        for k, v in enumerate(data):
+            self.flash[(a + k) % len(self.flash)] &= v    # bits only go 1 -> 0
+        self.busy_until = self.now_us + self.prog_us
+
+    def _spi_end(self):
+        """FSCE# rising edge: the command just shifted in takes effect."""
+        cmd, d = self.spi_cmd, self.spi_in
+        if self._busy() and cmd != 0x05:
+            return                       # ignored while busy, like real flash
+        if cmd == 0x06 and not self.write_protect:
+            self.wel = True
+        elif cmd == 0x04:
+            self.wel = False
+            self.aai_addr = None
+        elif cmd == 0xD7 and self.wel and self.erase_blocked:
+            self.dead_spi = True
+        elif cmd == 0xD7 and self.wel and len(d) >= 3:
+            a = ((d[0] << 16) | (d[1] << 8) | d[2]) & ~0x3FF
+            self.flash[a:a + 0x400] = b'\xFF' * 0x400
+            self.erased.append(a)
+            self.wel = False
+            self.busy_until = self.now_us + self.erase_us
+        elif cmd == 0xAD and self.aai_addr is not None and len(d) == 2:
+            self._program(self.aai_addr, d)
+            self.aai_addr += 2
+        elif cmd == 0xAD and self.wel and self.aai_addr is None and len(d) == 5:
+            a = (d[0] << 16) | (d[1] << 8) | d[2]
+            self._program(a, d[3:5])
+            self.aai_addr = a + 2
+
     def _spi_read(self):
-        if not self.cs:
+        if not self.cs or self.dead_spi:
             return 0xFF
         i = self.spi_idx
         self.spi_idx += 1
@@ -110,7 +163,11 @@ class SimEC:
             ident = b'\xFF\xFF\xFE'
             return ident[i] if i < len(ident) else 0x00
         if self.spi_cmd == 0x05:
-            return 0x00
+            if (self.busy_reads_ff and self._busy()) or \
+                    (self.aai_status_ff and self.aai_addr is not None):
+                return 0xFF
+            return ((0x01 if self._busy() else 0) | (0x02 if self.wel else 0) |
+                    (0x40 if self.aai_addr is not None else 0))
         if self.spi_cmd == 0x0B and len(self.spi_in) >= 4:
             a = (self.spi_in[0] << 16) | (self.spi_in[1] << 8) | self.spi_in[2]
             # the read address only advances inside a 256 KB window,
@@ -131,12 +188,14 @@ class SimLink(BaseLink):
              as GPIO by its firmware): they read 1 and arrive as 1.
     """
 
-    def __init__(self, ec, hotplug=True, dead=False, nwait_inv=False, stuck=0):
+    def __init__(self, ec, hotplug=True, dead=False, nwait_inv=False, stuck=0,
+                 release_on_reset=False):
         self.ec = ec
         self.hotplug = hotplug
         self.dead = dead
         self.sim_nwait_inv = nwait_inv
         self.stuck = stuck
+        self.release_on_reset = release_on_reset
         self.armed = False
         self.entered = False
         self.flags = proto.CFG_HANDSHAKE
@@ -170,8 +229,12 @@ class SimLink(BaseLink):
             return proto.ST_OK, 0xFF if not write else 0
         if self.flags & proto.CFG_SWAP_STROBE:
             addr = not addr
+        self.ec.now_us += 1
         if write:
             (self.ec.addr_write if addr else self.ec.data_write)(val | self.stuck)
+            if (not addr and self.ec.addr == 0x27 and (val | self.stuck) & 0x80
+                    and self.release_on_reset):
+                self.stuck = 0          # EC reset: firmware restarts, pins default
             return proto.ST_OK, 0
         v = self.ec.addr_read() if addr else self.ec.data_read()
         return proto.ST_OK, v | self.stuck
@@ -241,6 +304,8 @@ class SimLink(BaseLink):
                 if not need(4):
                     status, fail = proto.ST_BAD_OP, idx
                     break
+                if run:
+                    self.ec.now_us += struct.unpack_from('<I', p, i)[0]
                 i += 4
             elif op == proto.OP_WAIT_PIN:
                 if not need(4) or p[i] >= proto.LINE_COUNT:

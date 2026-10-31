@@ -95,6 +95,19 @@ The tool's entry modes:
   driven low and pull-ups on KSI0–KSI3 only; AC goes in; then the control lines are driven high.
 - **hotplug:** drive the strap with the board already on. Didn't work on the IT5261 above.
 
+**Halt early [hw].** On the ThinkPad the running EC firmware switches KSO1/KSO2 to GPIO
+("GPIO mode overrides EPP mode"): PD1/PD2 then read 1 and are received as 1. It happened within a
+minute of power-up, came and went every few milliseconds during the BIOS screen, and with the
+laptop off PD2 stayed taken for 10 minutes straight. A halt sent while the bits change only
+resets the EC (the laptop switches off) and the firmware starts again, with the pins clean for at
+least 2 s. So after the power-up entry the tool sends `27←81` at the first clean address echo and
+checks the echo stays clean for 3 s. If the bits are held at 1, `27` still arrives intact (its bits
+1–2 are 1) and `81` arrives as `87`, which still resets the EC: the tool does that on purpose after
+2 s of a held bus, then halts in the clean window that follows.
+
+The Pico can't detect the power-up by itself: with AC out, its pull-ups charge the unpowered EC
+within ~100 ms, after which the lines it would watch no longer read as clamped.
+
 ## 4. DBGR register access [port] + [hypothesis]
 
 The datasheet says DBGR "can be performed by one of the two interfaces: DBGR/EPP, DBGR/SMB. Both
@@ -165,8 +178,9 @@ Confirmed on the IT5261 **[hw]**: RDID returns `ff ff fe ff ff ff ff ff ff ff 5a
 the ITE signature at 0x80 (`a5 a5 a5 a5 a5 a5 a7 14 85 12 76 32 aa 00 55 55`, then
 `ITE8380-EC-V0.00`), and the Lenovo EC version string (`R1BHT82W`).
 
-The only SPI opcodes the tool can emit are 0x05, 0x0B and 0x9F; `flash.py` refuses anything else.
-Without a 0x06 (write enable) the flash ignores program and erase opcodes anyway.
+On the read path the only SPI opcodes the tool can emit are 0x05, 0x0B and 0x9F; `flash.py`
+refuses anything else. Without a 0x06 (write enable) the flash ignores program and erase opcodes
+anyway. Writing is a separate module (§5b).
 
 Optional writes, all EC registers and never the flash:
 
@@ -177,6 +191,53 @@ Optional writes, all EC registers and never the flash:
 | DBGR exit at the end (default; `--no-exit` skips it; not checked on the IT5261) | 0x1C08 = 0x10 |
 
 On 3-byte addressing parts these addresses are in bank 0xF0 (`0x80 ← F0`).
+
+## 5b. Writing the e-flash [port] + [hypothesis]
+
+The commands are iteflash's for IT5xxxx parts with the 8315 e-flash (`command_erase2`,
+`write_flash2`); the way the words are sent differs (see below). A 1 KB sector has been erased,
+programmed and verified on the IT5261; a full-image write is still to be done.
+
+```
+write enable:     SPI 06, then RDSR until (status & 03) == 02         (spi_check_write_enable)
+sector erase @A:  SPI D7, 08←A[23:16] 08←A[15:8] 08←00, then RDSR until BUSY clears, SPI 04
+                  1 KB sectors (4 pages) on the 8315 e-flash; 4 KB / 0x20 on KGD parts
+AAI program @A:   SPI 06, check WE, SPI AD, 08←A[23:16] 08←A[15:8] 08←A[7:0], 08←D0 08←D1,
+                  RDSR (its FSCE# rising edge starts the word), wait, read one status byte;
+                  then for each next word: SPI AD, 08←Dn 08←Dn+1, RDSR, wait, read;
+                  at the end SPI 04 (WRDI) ends AAI mode, then RDSR until BUSY clears
+```
+
+`SPI xx` is `05←FE 08←00 05←FD 08←xx`: FSCE# high (ends the previous command), then low with the
+opcode, as in §5.
+
+**Where it differs from iteflash.** After the first word, iteflash switches on a DBGR "quick
+AAI" mode (`10←20`) and streams the rest of the data through its I2C block address (0x79); the
+hardware then sends `AD Dn Dn+1` for each word by itself. EPP has no separate block address, and
+which register a block write lands on in quick mode isn't documented, so this tool doesn't use it.
+It sends each `AD Dn Dn+1` itself through ECINDDR (the SST-style AAI sequence quick mode
+automates), then RDSR, waits `--word-delay-us` (default 20 µs) and reads one status byte.
+
+**Seen on the IT5261 [hw]:**
+- The status register reads `fc` at rest (BUSY and WEL clear, upper bits set) and `fe` after
+  write enable.
+- It reads `ff` while a sector erase runs, and for the whole AAI sequence: it can't tell when a
+  word is done. So the per-word status value is ignored; the sector is read back instead, and a
+  mismatch lengthens the delay (×4) and redoes the sector.
+- The per-word RDSR + status read is still needed: with it, a 1 KB sector came back identical;
+  without it (FSCE# high and a delay only, up to 1.3 ms per word), the data stayed `ff`.
+- Without the protect-path writes the sector erase was silently ignored (content unchanged,
+  reads all `ff` until the next CPU reset). With them, the erase worked.
+- A 1 KB sector: erase, program (20 µs per word) and verify in 0.3 s.
+
+Per sector the tool does erase → blank check → program → read back and compare, with up to 3
+attempts. It only writes the sectors that differ from the image, and the one holding address 0
+last. The writer refuses every opcode except 04, 05, 06, AD and D7: no chip erase (60/C7), no
+status register write (50/01), no page program (02).
+
+Like iteflash, `write` first does the "disable protect path" writes (32 zeros at EC 0xF020A0–BF;
+`--keep-protect-path` skips them). Unlike iteflash it doesn't reset the GPIOs by default
+(`--reset-gpio` on `read`).
 
 ## 6. Open questions and the matching knobs
 

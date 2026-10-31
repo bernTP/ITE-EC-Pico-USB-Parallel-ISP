@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
-"""ite_pp_isp.py: read an ITE EC e-flash through the keyboard connector.
+"""ite_pp_isp.py: read or write an ITE EC e-flash through the keyboard connector.
 
 Parallel ISP (ITE DBGR over IEEE 1284 EPP on the KSI/KSO pins), using a
-Raspberry Pi Pico running firmware/ in between. Read-only: no erase
-or program command is ever sent to the flash.
+Raspberry Pi Pico running firmware/ in between. Only the `write` command
+erases or programs the flash; it backs it up first and asks before writing.
 
 Typical session (AC unplugged at the start):
     ./ite_pp_isp.py hello
     ./ite_pp_isp.py enter --mode powerup      (asks when to plug AC in)
     ./ite_pp_isp.py id
     ./ite_pp_isp.py read -o dump.bin --no-exit
+    ./ite_pp_isp.py write -i new.bin          (backup, plan, confirm, write, verify)
 """
 
 import argparse
 import os
+import signal
 import sys
 import time
 
@@ -22,9 +24,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from itepp import diag, proto                              # noqa: E402
 from itepp.dbgr import (Dbgr, BusError, DetectError,      # noqa: E402
                         bus_report)
-from itepp.dump import analyze, dump                       # noqa: E402
+from itepp.dump import ITE_SIGNATURE, analyze, dump        # noqa: E402
 from itepp.epp import EppConfig                            # noqa: E402
-from itepp.flash import Eflash, FlashError                 # noqa: E402
+from itepp.flash import EFLASH_TYPE_8315, Eflash, FlashError  # noqa: E402
+from itepp.program import (SECTOR, EflashWriter,           # noqa: E402
+                           image_problems, plan, runs, write_image)
 from itepp.link import LinkError, OpError, UsbLink         # noqa: E402
 from itepp.proto import Batch                              # noqa: E402
 from itepp.sim import SimEC, SimLink                       # noqa: E402
@@ -66,7 +70,8 @@ def connect(args):
         print(f'Pico: firmware {info["fw"]}, protocol v{info["proto"]}')
     epp_config(args).apply(link)
     if args.enter != 'none':
-        enter(link, args.enter, interactive=not args.sim)
+        enter(link, args.enter, interactive=not args.sim,
+              halt=not getattr(args, 'no_halt', False))
     return link
 
 
@@ -81,7 +86,7 @@ def ask(text):
         raise SystemExit('no input: stopped (lines left as they are)')
 
 
-def enter(link, mode, interactive=True):
+def enter(link, mode, interactive=True, halt=True):
     """Apply KSI[5,4,2,1] = 0011b so the EC enters DBGR/EPP."""
     if mode == 'hotplug':
         link.run(Batch().strap(proto.STRAP_DRIVE).delay_us(100000))
@@ -100,11 +105,18 @@ def enter(link, mode, interactive=True):
         ask('Press Enter, then plug in AC straight away')
     # 2. pattern: KSI4/KSI5 low, pull-ups on KSI0-3 only, the rest released
     link.run(Batch().safe(proto.PULL_NONE).pulls(KSI0_3, 0).pins_set(KSI4_5, 0))
+    # (the Pico can't see the power-up: its pull-ups charge the unpowered EC
+    #  within ~100 ms, so the clamp it would watch lets go before AC is in)
     if interactive:
         print('Pattern applied (KSI4/KSI5 low, pull-ups on KSI0-KSI3). PLUG IN AC NOW.')
-        ask('Press Enter once AC is in')
-    link.run(Batch().strap(proto.STRAP_DRIVE).delay_us(100000))
+        ask('Press Enter as soon as AC is in')
+    link.run(Batch().strap(proto.STRAP_DRIVE))
     print('Strap now driven.')
+    # 3. stop the EC CPU before its firmware takes KSO1/KSO2 as GPIO
+    if halt:
+        n = Dbgr(link).halt_on_clean_bus(stable_s=3.0 if interactive else 0.05)
+        print(f'EC CPU reset and halted ({n} halt command(s)): its firmware is stopped, '
+              'so the laptop is (or goes) off.')
 
 
 def progress_printer():
@@ -143,7 +155,7 @@ def cmd_lines(link, args):
 
 def cmd_enter(link, args):
     if args.enter == 'none':
-        enter(link, args.mode, interactive=not args.sim)
+        enter(link, args.mode, interactive=not args.sim, halt=not args.no_halt)
     try:
         print(bus_report(*Dbgr(link).check_bus()))
     except OpError as e:
@@ -280,12 +292,134 @@ def cmd_read(link, args):
     return 0
 
 
+RECOVER = """\
+The flash may now be partly written. Don't unplug AC or the Pico: the EC is
+halted and stays in parallel-port mode, so you can simply:
+  - run the same write command again (only sectors that still differ are
+    written), or
+  - put the old contents back: write -i {backup}"""
+
+
+def sector_progress():
+    t0 = time.time()
+
+    def show(done, total):
+        sys.stderr.write(f'\r  sector {done}/{total}  {done * 100 // total:3d}%  '
+                         f'{time.time() - t0:5.1f}s')
+        if done == total:
+            sys.stderr.write('\n')
+        sys.stderr.flush()
+    return show
+
+
+def cmd_write(link, args):
+    with open(args.input, 'rb') as f:
+        image = f.read()
+
+    dbgr = Dbgr(link)
+    try:
+        info = dbgr.detect(halt=True)
+    except DetectError as e:            # BusError included
+        raise SystemExit(f'error: {e}\nNothing was written.')
+    print(info)
+    ident = Eflash(link).read_id()
+    ftype = Eflash.flash_type(ident)
+    print(f'EFLASH TYPE = {ftype or "unknown"} (id {ident[:3].hex(" ")})')
+    if ftype != EFLASH_TYPE_8315:
+        raise SystemExit('Only the 8315 e-flash (id ff ff fe) can be written. '
+                         'Nothing was written.')
+    if len(image) != info.flash_size:
+        raise SystemExit(f'{args.input} is {len(image)} bytes but the flash is '
+                         f'{info.flash_size}: give a full image. Nothing was written.')
+    problems = image_problems(image)
+    if problems and not args.force:
+        raise SystemExit('REFUSED: ' + '; '.join(problems) +
+                         '\nNothing was written (--force writes it anyway).')
+    for p in problems:
+        print(f'WARNING: {p}')
+    base, size = parse_range(args.range, info.flash_size)
+    if size <= 0 or base + size > info.flash_size or base % SECTOR or size % SECTOR:
+        raise SystemExit(f'range 0x{base:X}+0x{size:X}: must be inside the flash and '
+                         f'1 KB aligned (0x{SECTOR:X})')
+
+    print('Reading the current flash twice (backup)...')
+    images, diffs = dump(Eflash(link), 0, info.flash_size, passes=2,
+                         read_reg=args.read_reg, progress=progress_printer())
+    if diffs:
+        raise SystemExit(f'the two reads differ in {len(diffs)} bytes: the link is not '
+                         'reliable enough to write. Nothing was written.')
+    current = images[0]
+    backup = args.backup or f'backup-{info.chip_id:05x}-{time.strftime("%Y%m%d-%H%M%S")}.bin'
+    with open(backup, 'wb') as f:
+        f.write(current)
+    print(f'Backup: {backup}')
+    for note in analyze(current):
+        print('  ' + note)
+
+    sectors = plan(image, current, base, size, rewrite_all=args.all)
+    if not sectors:
+        print('The flash already holds this image in that range: nothing to write.')
+        return 0
+    print(f'{len(sectors)} sector(s) of 1 KB to erase and program: {runs(sectors)}')
+    if args.dry_run:
+        print('Dry run: nothing was written.')
+        return 0
+
+    stuck_high, stuck_low = dbgr.check_bus()
+    if stuck_high or stuck_low:
+        raise SystemExit(f'error: {bus_report(stuck_high, stuck_low)}\nNothing was written.')
+    if not args.yes:
+        print('The EC firmware will be replaced in these sectors. If the result does '
+              'not boot,\nthis same tool can write the backup back.')
+        try:
+            answer = input('>>> Type WRITE to go ahead: ')
+        except EOFError:
+            answer = ''
+        if answer.strip() != 'WRITE':
+            raise SystemExit('Not confirmed: nothing was written.')
+
+    if not args.keep_protect_path:
+        dbgr.disable_protect_path()
+        print('Protect path disabled (EC 0x20A0-0x20BF = 0).')
+    stop = []
+    old_handler = signal.signal(signal.SIGINT, lambda *_: stop.append(1))
+    sig = current.find(ITE_SIGNATURE)
+    ref = (sig, current[sig:sig + 16]) if sig >= 0 else None
+    writer = EflashWriter(link, word_delay_us=args.word_delay_us, read_reg=args.read_reg,
+                          ref=ref)
+    print('Writing (Ctrl-C stops cleanly after the current sector)...')
+    try:
+        write_image(writer, image, sectors, progress=sector_progress(),
+                    should_stop=lambda: bool(stop))
+    except (FlashError, OpError, LinkError) as e:
+        print(f'\nWRITE FAILED: {e}', file=sys.stderr)
+        print(RECOVER.format(backup=backup), file=sys.stderr)
+        return 3
+    finally:
+        signal.signal(signal.SIGINT, old_handler)
+
+    print(f'Verifying 0x{base:06X}-0x{base + size - 1:06X}...')
+    final = Eflash(link).read(base, size, read_reg=args.read_reg)
+    want = image[base:base + size]
+    if final != want:
+        bad = [i for i in range(size) if final[i] != want[i]]
+        print(f'VERIFY FAILED: {len(bad)} bytes differ (first at 0x{base + bad[0]:06X}).',
+              file=sys.stderr)
+        print(RECOVER.format(backup=backup), file=sys.stderr)
+        return 3
+    print(f'Verify OK. Word delay used: {writer.word_delay_us} us.')
+    print('The EC is still halted. To boot the new firmware: `safe`, unplug AC for a few '
+          'seconds, plug it back in.')
+    return 0
+
+
 # ─── Main ───────────────────────────────────────────────────────────
 
 def build_parser():
     p = argparse.ArgumentParser(
-        description='Read an ITE EC e-flash over the keyboard connector '
-                    '(parallel ISP / DBGR over EPP) with a Raspberry Pi Pico. Read-only.',
+        description='Read or write an ITE EC e-flash over the keyboard connector '
+                    '(parallel ISP / DBGR over EPP) with a Raspberry Pi Pico. Only '
+                    '`write` changes the flash.',
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=TROUBLE)
 
     g = p.add_argument_group('EPP tuning (any command)')
@@ -331,6 +465,8 @@ def build_parser():
     s.add_argument('--mode', choices=['hotplug', 'powerup'], default='powerup',
                    help='powerup (default): AC unplugged first, the tool says when to '
                         'plug it in. hotplug: board already powered')
+    s.add_argument('--no-halt', action='store_true',
+                   help="powerup: don't reset+halt the EC CPU once it answers")
     s.set_defaults(func=cmd_enter)
 
     s = sub.add_parser('probe', help='try EPP settings, report which one answers')
@@ -370,6 +506,31 @@ def build_parser():
                    help='read even if the e-flash ID is not recognised')
     s.add_argument('--no-exit', action='store_true', help="don't send DBGR exit at the end")
     s.set_defaults(func=cmd_read)
+
+    s = sub.add_parser('write', help='erase and program the e-flash from a file '
+                                     '(backs up and asks first)')
+    s.add_argument('-i', '--input', required=True, metavar='FILE',
+                   help='full flash image (same size as the flash)')
+    s.add_argument('-R', '--range', metavar='BASE[:SIZE]',
+                   help='only write this hex range of the image, 1 KB aligned')
+    s.add_argument('--all', action='store_true',
+                   help='rewrite every sector in the range, even unchanged ones')
+    s.add_argument('--dry-run', action='store_true',
+                   help='back up and list the sectors that would change, write nothing')
+    s.add_argument('--backup', metavar='FILE',
+                   help='where to save the current flash (default backup-<chip>-<time>.bin)')
+    s.add_argument('--yes', action='store_true', help="don't ask for confirmation")
+    s.add_argument('--force', action='store_true',
+                   help='write an image that fails the sanity checks')
+    s.add_argument('--word-delay-us', type=int, default=20, metavar='US',
+                   help='wait after each 2-byte word (default 20; raised automatically '
+                        'when a sector does not verify)')
+    s.add_argument('--keep-protect-path', action='store_true',
+                   help="don't zero EC 0x20A0-0x20BF first (iteflash and this tool do by "
+                        'default; without it the IT5261 ignores erases)')
+    s.add_argument('--read-reg', type=lambda x: int(x, 16), default=0x09, metavar='RR',
+                   help='DBGR register for burst reads (09 or 08)')
+    s.set_defaults(func=cmd_write)
     return p
 
 
@@ -391,7 +552,7 @@ def main(argv=None):
         elif e.status == proto.ST_NWAIT_TIMEOUT:
             print(TROUBLE, file=sys.stderr)
         return 1
-    except (LinkError, FlashError) as e:
+    except (LinkError, FlashError, DetectError) as e:
         print(f'error: {e}', file=sys.stderr)
         return 1
     except KeyboardInterrupt:

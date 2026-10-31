@@ -9,7 +9,10 @@ An EPP address read returns the complement of the last address written,
 which tests all 8 data lines in both directions without touching a register.
 """
 
+import time
+
 from . import proto
+from .link import OpError
 from .proto import Batch
 
 # EC memory window (D2EC): 0x2F = address high, 0x2E = address low,
@@ -99,6 +102,66 @@ class Dbgr:
             stuck_low |= want & ~r
         return stuck_high & 0xFF, stuck_low & 0xFF
 
+    def bus_clean(self):
+        """check_bus() without exceptions: False while the EC doesn't answer."""
+        try:
+            return self.check_bus() == (0, 0)
+        except OpError:
+            return False
+
+    def halt_on_clean_bus(self, timeout_s=60, stable_s=3.0, settle_s=0.5,
+                          kick_after_s=2.0, max_kicks=5, log=print):
+        """Reset and halt the CPU (27<-81, iteflash's IT5xxxx halt) at the first
+        clean address echo, then check the bus stays clean.
+
+        The running EC firmware can take KSO1/KSO2 as GPIO (IT5261 on a
+        ThinkPad), and then nothing can be sent reliably. If the bus stays held
+        with bits stuck at 1 only, register 0x27 still arrives intact (its bits
+        1 and 2 are already 1) and 0x81 arrives as 0x87: that still resets the
+        EC, the firmware starts again with the pins at their defaults, and the
+        next clean echo gets the real halt. A halt that doesn't hold is retried.
+        Returns the number of halts sent."""
+        t0 = time.monotonic()
+        halts = kicks = 0
+        dirty_since = None
+        while time.monotonic() - t0 < timeout_s:
+            try:
+                high, low = self.check_bus()
+            except OpError:
+                high = low = None                    # not answering (in reset)
+            if (high, low) != (0, 0):
+                now = time.monotonic()
+                if high and not low and kicks < max_kicks:
+                    dirty_since = dirty_since or now
+                    if now - dirty_since > kick_after_s:
+                        kicks += 1
+                        log(f'{bus_report(high, low)}: resetting the EC for a clean window')
+                        self.link.run(Batch().reg_write(REG_CPU, 0x81), check=False)
+                        dirty_since = None
+                else:
+                    dirty_since = None
+                time.sleep(0.001)
+                continue
+            dirty_since = None
+            b = Batch()
+            for v in ECHO_PATTERNS:
+                b.aw(v).ar()
+            if not self.link.run(b.reg_write(REG_CPU, 0x81), check=False).ok:
+                continue
+            halts += 1
+            t1 = time.monotonic()
+            held = True
+            while time.monotonic() - t1 < stable_s:
+                if not self.bus_clean() and time.monotonic() - t1 > settle_s:
+                    held = False
+                    break
+                time.sleep(0.02)
+            if held:
+                return halts
+            log(f'halt #{halts} did not hold (EC firmware running again), retrying')
+        raise BusError(f'no lasting clean bus within {timeout_s:.0f}s '
+                       f'({halts} halt(s), {kicks} reset(s) sent)')
+
     def _mem_select(self, b, addr, bank):
         if bank:
             b.reg_write(REG_MEM_BANK, (addr >> 16) & 0xFF)
@@ -184,6 +247,12 @@ class Dbgr:
         """ETWCFG: stop the EC watchdog (PP mode already does it in hardware)."""
         reg = 0x1F85 if self.info.instruction_set_v2 else 0x1F05
         self.ec_write(self._ec_addr(reg), 0x30, bank=self.info.addr_3bytes)
+
+    def disable_protect_path(self):
+        """iteflash dbgr_disable_protect_path: zero EC 0x20A0..0x20BF, which
+        EC firmware can use to keep DBGR from erasing or programming."""
+        for i in range(32):
+            self.ec_write(self._ec_addr(0x20A0 + i), 0x00, bank=self.info.addr_3bytes)
 
     def reset_gpio(self):
         self.ec_write(self._ec_addr(0x2007), 0x02, bank=self.info.addr_3bytes)

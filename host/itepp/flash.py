@@ -1,4 +1,4 @@
-"""E-flash access in DBGR follow mode (read only).
+"""E-flash access in DBGR follow mode, read side (writes: program.py).
 
 Follow mode maps the e-flash as a SPI device behind the EC-indirect
 registers: ECINDAR3..0 = regs 0x07..0x04, ECINDDR = reg 0x08.
@@ -39,7 +39,7 @@ def _follow_enter(b):
 
 def _spi_command(b, cmd):
     if cmd not in READ_ONLY_OPCODES:
-        raise ValueError(f'SPI opcode {cmd:#04x} refused: read-only tool')
+        raise ValueError(f'SPI opcode {cmd:#04x} refused on the read path')
     return b.reg_writes([(0x05, 0xFE), (0x08, 0x00), (0x05, 0xFD), (0x08, cmd)])
 
 

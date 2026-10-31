@@ -1,12 +1,14 @@
 # ITE EC Pico USB Parallel ISP
 
-This project reads the embedded flash of an **ITE IT5261VG-256** embedded controller (EC) through
-the laptop's **keyboard FFC connector**. It uses the ITE "parallel ISP" path: the chip's debugger
+This project reads and writes the embedded flash of an **ITE IT5261VG-256** embedded controller (EC)
+through the laptop's **keyboard FFC connector**. It uses the ITE "parallel ISP" path: the chip's debugger
 (DBGR) talks IEEE 1284 EPP over the KSI/KSO keyboard-scan pins. A **Raspberry Pi Pico**
 wired to that connector does the low-level signalling, and any Linux machine with Python, such as a
 **Raspberry Pi Zero**, drives the Pico over USB and writes a `.bin`.
 
-The tool is **read-only**. It never sends erase, write-enable or program commands to the flash.
+Only the `write` command erases or programs the flash. It backs the flash up first, only touches the
+1 KB sectors that differ, verifies each one, and asks before it starts. Every other command is
+read-only: the read path refuses any SPI opcode other than read, fast read and read status.
 
 It is inspired by [I2C-Pico-USB-ITE-EC-prog](https://github.com/JohnDoe150489/I2C-Pico-USB-ITE-EC-prog),
 which drives the same DBGR block over I2C/SMBus. Here the transport is the keyboard connector
@@ -21,6 +23,9 @@ instead.
 >   address and data cycles map onto the DBGR registers exactly as the I2C path does.
 > - **Learned on the hardware:** the entry only works at power-up, with KSI1/KSI2 on pull-ups
 >   (see [Reading the chip](#reading-the-chip)).
+> - **`write` works on this chip** for a single sector so far. Its erase and AAI word-program
+>   commands are the ones `iteflash` uses, sent one word at a time instead of through iteflash's
+>   "quick AAI" shortcut. See [Writing the chip](#writing-the-chip).
 >
 > [docs/PROTOCOL.md](docs/PROTOCOL.md) has all the evidence.
 
@@ -197,12 +202,18 @@ On Windows, bind the device to WinUSB with Zadig. On macOS, nothing extra is nee
    The tool first drives every line low so the EC discharges, and asks you to wait until it is
    fully off (an unused keyboard pin such as FFC pin 21 near 0 V on a meter, or a few minutes).
    Press Enter, **plug AC in straight away**, then press Enter again. At that moment KSI4/KSI5 are
-   low and KSI1/KSI2 sit on pull-ups, which is the pattern the EC latches at power-up.
+   low and KSI1/KSI2 sit on pull-ups, which is the pattern the EC latches at power-up. The tool then
+   resets and halts the EC CPU at the first clean address echo. The EC firmware has to be stopped:
+   on the ThinkPad it switches KSO1/KSO2 (PD1/PD2) to GPIO while it runs, and then nothing can be
+   sent reliably. If those bits are already held, the tool resets the EC once on purpose (the reset
+   gets through even with them stuck) and halts it in the clean seconds that follow. With the EC
+   stopped, the laptop is or goes off. `--no-halt` skips all this.
 
    Expected output on an IT5261:
 
    ```
    Strap now driven.
+   EC CPU reset and halted (1 halt command(s)): its firmware is stopped, so the laptop is (or goes) off.
    Address echo OK: all 8 data bits answer.
    DBGR regs 00..02: 52 61 02  (IT5261: 52 61 02)
    ```
@@ -274,6 +285,7 @@ isp --enter powerup read -o it5261.bin --no-exit
 | `raw "rr 00; aw 01; dr 1"` | Run hand-written EPP ops (`raw help` lists them). |
 | `id [--no-halt]` | Chip ID, flash size, e-flash type. |
 | `read -o FILE [-R BASE[:SIZE]] [-s KB] [--passes N]` | Dump the flash. |
+| `write -i FILE [-R BASE[:SIZE]] [--dry-run]` | Back up, then erase and program the sectors that differ from `FILE`. See [Writing the chip](#writing-the-chip). |
 | `safe` | Release all lines. |
 
 Options for `read`:
@@ -298,6 +310,67 @@ EPP tuning flags work on every command:
 | `--no-release` | Don't wait for nWait to return after a strobe. |
 | `--setup-ns`, `--strobe-ns`, `--hold-ns`, `--timeout-us` | Timing values. |
 
+## Writing the chip
+
+> **Tested on the IT5261 (ThinkPad T14s Gen 1):** a 1 KB sector erased, programmed and verified in
+> 0.3 s. A full-image write hasn't been done yet. Make a verified dump first (`read`) and keep it
+> somewhere safe.
+
+`write` replaces the EC firmware with the contents of a file:
+
+```sh
+isp write -i new.bin
+```
+
+What it does, in order:
+
+1. Detects the chip, resets and halts the EC CPU, and checks the address echo. It stops if a data
+   bit doesn't answer, or if the e-flash isn't the 8315 type (id `ff ff fe`).
+2. Checks the file: it must be a full image (256 KB here), not blank, with the ITE signature
+   (a run of `0xA5`) in its first 4 KB. `--force` overrides the content checks, not the size.
+3. Reads the whole flash twice, stops if the reads differ, and saves it as
+   `backup-<chip>-<date>.bin` (or `--backup FILE`).
+4. Lists the 1 KB sectors that differ from the file. `--dry-run` stops here.
+5. Asks you to type `WRITE` (`--yes` skips the question).
+6. For each sector: erase, check it reads blank, program it word by word, read it back and compare.
+   A failed sector is redone up to 3 times. The sector holding address 0 (reset vector and
+   signature) is written last.
+7. Reads the whole range back and compares it with the file.
+
+Afterwards the EC is still halted. Run `isp safe`, unplug AC for a few seconds and plug it back in:
+the EC then boots the new firmware.
+
+**If it fails halfway,** don't unplug anything. The EC stays halted in parallel-port mode, so you
+can run the same command again (only the sectors that still differ are written), or put the backup
+back with `isp write -i backup-….bin`. If the board was unplugged in between, the power-up entry
+still works: it's handled by the chip's hardware, not by the firmware you just wrote.
+
+**A first test that changes nothing:** rewrite sectors with their own contents, from your own
+verified dump. The flash ends up exactly as it was.
+
+```sh
+isp write -i it5261.bin -R 3F000:400 --all     # blank sector: tests erase only
+isp write -i it5261.bin -R 3FC00:400 --all     # sector with data: erase, program, verify
+```
+
+On the T14s dump, 0x3F000 is all `0xFF` and 0x3FC00 holds 10 data bytes; check your own dump
+before picking a sector.
+
+| Option | Effect |
+|--------|--------|
+| `-R BASE[:SIZE]` | Only write this hex range of the image (1 KB aligned). |
+| `--all` | Rewrite every sector in the range, even unchanged ones. |
+| `--dry-run` | Back up and list the sectors that would change; write nothing. |
+| `--backup FILE` | Where to save the current flash. |
+| `--yes` | Don't ask for confirmation. |
+| `--force` | Write an image that fails the content checks. |
+| `--keep-protect-path` | Don't zero EC registers 0x20A0–0x20BF first. By default `write` zeroes them, as iteflash does; on the ThinkPad IT5261 the erase is silently ignored without it. |
+| `--word-delay-us N` | Wait after each 2-byte word (default 20). Raised automatically when a sector doesn't read back as written. |
+| `--read-reg 08` | Burst-read register for the backup and the checks. |
+
+`write` never sends chip erase (`0x60`) or status register writes (`0x50`/`0x01`). It uses only
+write enable/disable, 1 KB sector erase (`0xD7`), AAI word program (`0xAD`) and read status.
+
 ## Troubleshooting
 
 | Symptom | What to try |
@@ -309,7 +382,8 @@ EPP tuning flags work on every command:
 | `NWAIT_TIMEOUT` on everything | Run `lines` (unpowered) to check wiring and GND. Use the power-up entry. Then run `probe` (it tries `--no-handshake` and `--nwait-invert`). |
 | `regs 00..02` are `ff ff ff` or `00 00 00` | The EC is not in DBGR/EPP mode. Check the FFC orientation, then redo `enter --mode powerup`: the EC must be fully discharged first, and AC must go in while the tool shows "PLUG IN AC NOW". |
 | A `probe` with handshake and the slow timing says `OK`, but the data is `ff` | The EC is still scanning the keyboard: its pulses on BUSY (KSO9) fake the handshake. Same fix as the row above. |
-| `Address echo FAILED: PD1 … stuck at 1` | The EC firmware has switched those KBS pins to GPIO, which overrides EPP (seen on KSO1/KSO2 of an IT5261 while its firmware ran). `id` and `read` refuse to continue, since register numbers would be corrupted. Run `enter` (or `id`) again a little later, or power-cycle and redo the power-up entry. Once `id` has halted the EC, it stays clean. || `Unknown EFLASH ID` | Chip ID works but follow mode doesn't. Try `--read-reg 08` with `--ignore-flash-id` and look at the dump. |
+| `Address echo FAILED: PD1 … stuck at 1` | The EC firmware has switched those KBS pins to GPIO, which overrides EPP (seen on KSO1/KSO2 of an IT5261 while its firmware ran). `id` and `read` refuse to continue, since register numbers would be corrupted. Unplug AC and redo `enter`: it halts the EC before the firmware runs. Waiting for the pins to come back is unreliable (with the laptop off they stayed taken for 10 minutes). |
+| `Unknown EFLASH ID` | Chip ID works but follow mode doesn't. Try `--read-reg 08` with `--ignore-flash-id` and look at the dump. |
 | The two passes differ | Use slower timing, for example `--setup-ns 2000 --hold-ns 1000`. |
 | Dump is all `FF` / every page identical | The read address isn't advancing. Try `--read-reg 08`. |
 
