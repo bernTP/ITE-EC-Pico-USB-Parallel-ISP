@@ -284,7 +284,8 @@ isp --enter powerup read -o it5261.bin --no-exit
 | `regs [--start 00 --end ff]` | Dump DBGR registers through EPP. |
 | `raw "rr 00; aw 01; dr 1"` | Run hand-written EPP ops (`raw help` lists them). |
 | `id [--no-halt]` | Chip ID, flash size, e-flash type. |
-| `read -o FILE [-R BASE[:SIZE]] [-s KB] [--passes N]` | Dump the flash. |
+| `read -o FILE [-R BASE[:SIZE]] [-s KB] [--passes N]` | Dump the flash. Checks the address echo afterwards. |
+| `verify [-i FILE] [--ignore BASE[:SIZE]] [-o FILE]` | Read only: check that reads can be trusted before writing. See [Writing the chip](#writing-the-chip). |
 | `write -i FILE [-R BASE[:SIZE]] [--dry-run]` | Back up, then erase and program the sectors that differ from `FILE`. See [Writing the chip](#writing-the-chip). |
 | `safe` | Release all lines. |
 
@@ -316,6 +317,28 @@ EPP tuning flags work on every command:
 > 0.3 s. A full-image write hasn't been done yet. Make a verified dump first (`read`) and keep it
 > somewhere safe.
 
+**Check the read path first.** `write` trusts its reads three times: the backup, the blank check
+after each erase and the read-back after each sector. Two `read` passes that agree only rule out
+random errors: a data line that is open for the whole read returns the same wrong bytes every
+time. `verify` sends only read commands and checks more:
+
+```sh
+isp verify -i it5261.bin --ignore 3B800
+```
+
+1. the address echo before and after the reads (all 8 data lines, both directions),
+2. 3 passes through register 09, identical,
+3. 1 pass through register 08 (the other burst-read path), identical,
+4. every 1 KB sector read on its own, in shuffled order, the way `write` reads them. In order, a
+   fast read that ignored its address and carried on would still match,
+5. with `-i`, the comparison with a dump from an earlier power cycle. `--ignore 3B800` leaves out
+   the area the EC firmware rewrites itself (0x3B800 to the end on the T14s).
+
+A failed check names the lines involved: `PD2 (FFC pin 11) 37x 0->1 0x 1->0` (one line, always
+the same way) is that wire or joint. All lines flipping both ways is real content. On success it
+saves the dump as `verify-<chip>-<date>.bin`. That is the flash as it is right now, so use it as
+the source of the test below. Exit code 0 means every check passed, 2 means one didn't.
+
 `write` replaces the EC firmware with the contents of a file:
 
 ```sh
@@ -328,8 +351,8 @@ What it does, in order:
    bit doesn't answer, or if the e-flash isn't the 8315 type (id `ff ff fe`).
 2. Checks the file: it must be a full image (256 KB here), not blank, with the ITE signature
    (a run of `0xA5`) in its first 4 KB. `--force` overrides the content checks, not the size.
-3. Reads the whole flash twice, stops if the reads differ, and saves it as
-   `backup-<chip>-<date>.bin` (or `--backup FILE`).
+3. Reads the whole flash twice, stops if the reads differ or the address echo fails afterwards,
+   and saves it as `backup-<chip>-<date>.bin` (or `--backup FILE`).
 4. Lists the 1 KB sectors that differ from the file. `--dry-run` stops here.
 5. Asks you to type `WRITE` (`--yes` skips the question).
 6. For each sector: erase, check it reads blank, program it word by word, read it back and compare.
@@ -345,16 +368,18 @@ can run the same command again (only the sectors that still differ are written),
 back with `isp write -i backup-….bin`. If the board was unplugged in between, the power-up entry
 still works: it's handled by the chip's hardware, not by the firmware you just wrote.
 
-**A first test that changes nothing:** rewrite sectors with their own contents, from your own
-verified dump. The flash ends up exactly as it was.
+**A first test that changes nothing:** rewrite sectors with their own contents, from a dump made
+in the same power cycle (the `verify-….bin` file). The EC firmware rewrites its data area
+(0x3B800 to the end on the T14s) while it runs, so an older dump differs there. The flash ends up
+exactly as it was.
 
 ```sh
-isp write -i it5261.bin -R 3F000:400 --all     # blank sector: tests erase only
-isp write -i it5261.bin -R 3FC00:400 --all     # sector with data: erase, program, verify
+isp write -i verify-05261-….bin -R 3F000:400 --all    # sector with few data bytes
+isp write -i verify-05261-….bin -R 3FC00:400 --all    # erase, program, verify
 ```
 
-On the T14s dump, 0x3F000 is all `0xFF` and 0x3FC00 holds 10 data bytes; check your own dump
-before picking a sector.
+Both sectors are in the EC's data area, away from the code. Check how many data bytes your fresh
+dump has in them before you pick one.
 
 | Option | Effect |
 |--------|--------|
@@ -412,7 +437,7 @@ firmware/   Pico firmware (C, Pico SDK, TinyUSB vendor class)
   lines.c     pin control + entry strap     proto.h  wire protocol
 host/       Python tool (pyusb)
   ite_pp_isp.py   CLI
-  itepp/          proto, link (USB), sim, epp, dbgr, flash, dump, diag
+  itepp/          proto, link (USB), sim, epp, dbgr, flash, dump, diag, program, verify
 docs/PROTOCOL.md  how the ITE parallel ISP works, sources, open questions
 ```
 

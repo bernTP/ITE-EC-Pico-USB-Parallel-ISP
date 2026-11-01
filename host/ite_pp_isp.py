@@ -10,6 +10,7 @@ Typical session (AC unplugged at the start):
     ./ite_pp_isp.py enter --mode powerup      (asks when to plug AC in)
     ./ite_pp_isp.py id
     ./ite_pp_isp.py read -o dump.bin --no-exit
+    ./ite_pp_isp.py verify -i dump.bin        (can reads be trusted? read only)
     ./ite_pp_isp.py write -i new.bin          (backup, plan, confirm, write, verify)
 """
 
@@ -32,6 +33,7 @@ from itepp.program import (SECTOR, EflashWriter,           # noqa: E402
 from itepp.link import LinkError, OpError, UsbLink         # noqa: E402
 from itepp.proto import Batch                              # noqa: E402
 from itepp.sim import SimEC, SimLink                       # noqa: E402
+from itepp.verify import verify_read                       # noqa: E402
 
 PAGE = 256
 
@@ -266,6 +268,8 @@ def cmd_read(link, args):
                          read_reg=args.read_reg, chunk=args.chunk,
                          progress=progress_printer())
     dt = time.time() - t0
+    # a line that opened during the read gives the same wrong bytes every pass
+    stuck = dbgr.check_bus()
 
     with open(args.output, 'wb') as f:
         f.write(images[0])
@@ -276,6 +280,10 @@ def cmd_read(link, args):
     if not args.no_exit:
         dbgr.exit()
 
+    if any(stuck):
+        print(f'VERIFY FAILED: after the read, {bus_report(*stuck)}. Identical passes '
+              'can still be wrong: check that line and read again.')
+        return 2
     if diffs:
         stem, ext = os.path.splitext(args.output)
         for i, img in enumerate(images[1:], start=2):
@@ -289,6 +297,49 @@ def cmd_read(link, args):
         return 2
     if args.passes > 1:
         print(f'Verify OK: {args.passes} passes identical.')
+    return 0
+
+
+def cmd_verify(link, args):
+    if args.passes < 2:
+        raise SystemExit('verify needs --passes 2 or more')
+    ref = None
+    if args.input:
+        with open(args.input, 'rb') as f:
+            ref = f.read()
+    dbgr, info = detect(link, args)
+    check_flash_id(link, args)
+    if ref is not None and len(ref) != info.flash_size:
+        raise SystemExit(f'{args.input} is {len(ref)} bytes but the flash is '
+                         f'{info.flash_size}: give a full dump')
+    ignore = [parse_range(r, info.flash_size) for r in args.ignore]
+
+    print(f'Checking the read path: {args.passes} passes through reg 09, 1 through reg 08, '
+          f'then every 1 KB sector on its own...')
+    rep = verify_read(dbgr, Eflash(link), info.flash_size, passes=args.passes, ref=ref,
+                      ignore=ignore, progress=progress_printer())
+    for name, ok, detail in rep.checks:
+        print(f'  {"OK  " if ok else "FAIL"}  {name}' + ('' if ok else f'\n          {detail}'))
+    if rep.ref:
+        ok, detail = rep.ref
+        print(f'  {"OK  " if ok else "FAIL"}  same as {args.input}: {detail}')
+
+    if not rep.read_ok:
+        print("READ PATH NOT RELIABLE: don't write. One PDn that always reads the same way "
+              'is that wire or joint;\nrandom bits on every line point at timing '
+              '(try --setup-ns 1000 --hold-ns 500).')
+        return 2
+    out = args.output or f'verify-{info.chip_id:05x}-{time.strftime("%Y%m%d-%H%M%S")}.bin'
+    with open(out, 'wb') as f:
+        f.write(rep.image)
+    print(f'Wrote {out} (checked dump of the flash as it is now)')
+    for note in analyze(rep.image):
+        print('  ' + note)
+    print('READ PATH OK: dumps, the backup of `write` and its per-sector checks can be '
+          'trusted on this connection.')
+    if rep.ref and not rep.ref[0]:
+        print(f'The flash differs from {args.input} outside the ignored ranges.')
+        return 2
     return 0
 
 
@@ -348,6 +399,10 @@ def cmd_write(link, args):
     if diffs:
         raise SystemExit(f'the two reads differ in {len(diffs)} bytes: the link is not '
                          'reliable enough to write. Nothing was written.')
+    stuck_high, stuck_low = dbgr.check_bus()
+    if stuck_high or stuck_low:
+        raise SystemExit(f'error: after the backup read, {bus_report(stuck_high, stuck_low)}'
+                         '\nNothing was written.')
     current = images[0]
     backup = args.backup or f'backup-{info.chip_id:05x}-{time.strftime("%Y%m%d-%H%M%S")}.bin'
     with open(backup, 'wb') as f:
@@ -365,9 +420,6 @@ def cmd_write(link, args):
         print('Dry run: nothing was written.')
         return 0
 
-    stuck_high, stuck_low = dbgr.check_bus()
-    if stuck_high or stuck_low:
-        raise SystemExit(f'error: {bus_report(stuck_high, stuck_low)}\nNothing was written.')
     if not args.yes:
         print('The EC firmware will be replaced in these sectors. If the result does '
               'not boot,\nthis same tool can write the backup back.')
@@ -506,6 +558,23 @@ def build_parser():
                    help='read even if the e-flash ID is not recognised')
     s.add_argument('--no-exit', action='store_true', help="don't send DBGR exit at the end")
     s.set_defaults(func=cmd_read)
+
+    s = sub.add_parser('verify', help='check that reads can be trusted before writing '
+                                      '(read only)')
+    s.add_argument('-i', '--input', metavar='FILE',
+                   help='also compare with this full dump, e.g. one from an earlier power cycle')
+    s.add_argument('--ignore', action='append', default=[], metavar='BASE[:SIZE]',
+                   help='hex range left out of the comparison with FILE: data the EC '
+                        'firmware rewrites itself (T14s: 3B800). Repeatable')
+    s.add_argument('-o', '--output', metavar='FILE',
+                   help='where to save the checked dump (default verify-<chip>-<time>.bin)')
+    s.add_argument('--passes', type=int, default=3,
+                   help='sequential passes through reg 09 (default 3)')
+    s.add_argument('--no-halt', action='store_true',
+                   help="don't reset+halt the EC CPU on IT5xxxx")
+    s.add_argument('--ignore-flash-id', action='store_true',
+                   help='check even if the e-flash ID is not recognised')
+    s.set_defaults(func=cmd_verify)
 
     s = sub.add_parser('write', help='erase and program the e-flash from a file '
                                      '(backs up and asks first)')
