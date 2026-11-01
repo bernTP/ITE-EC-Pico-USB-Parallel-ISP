@@ -246,8 +246,9 @@ On Windows, bind the device to WinUSB with Zadig. On macOS, nothing extra is nee
    EFLASH TYPE = 8315 (id ff ff fe)
    ```
 
-   `id` checks the address echo first and stops if a data bit doesn't answer. It then resets and
-   halts the EC CPU, so its firmware stops running (`--no-halt` skips that).
+   `id` checks the address echo first and stops if a data bit doesn't answer. It doesn't reset the
+   EC CPU: `enter` halted it once, and a second reset can let its firmware run (see
+   [One CPU halt per power cycle](#one-cpu-halt-per-power-cycle)).
 
 6. **Dump the flash.**
 
@@ -266,8 +267,8 @@ On Windows, bind the device to WinUSB with Zadig. On macOS, nothing extra is nee
 
 The Pico keeps the strap applied between commands. `isp safe` releases every line, and `lines`
 does too. The EC latches the pattern at power-up and stays in parallel-port mode until AC is
-removed, so `isp enter --mode hotplug` re-arms the Pico in the same power cycle. You can also put
-`--enter powerup` in front of any command to do the entry first:
+removed, so `isp enter --mode hotplug` re-arms the Pico in the same power cycle (without halting
+the CPU again). You can also put `--enter powerup` in front of any command to do the entry first:
 
 ```sh
 isp --enter powerup read -o it5261.bin --no-exit
@@ -279,11 +280,11 @@ isp --enter powerup read -o it5261.bin --no-exit
 |---------|---------|
 | `hello` | Check that the Pico and its firmware answer. |
 | `lines [--samples N]` | Wiring / power check of the 15 lines. Leaves them released. |
-| `enter [--mode powerup\|hotplug]` | Apply the DBGR/EPP entry strap (KSI[5,4,2,1] = 0011b), then check the address echo and print regs 00..02. `powerup` (default) asks when to plug AC in. |
+| `enter [--mode powerup\|hotplug]` | Apply the DBGR/EPP entry strap (KSI[5,4,2,1] = 0011b), then check the address echo and print regs 00..02. `powerup` (default) asks when to plug AC in, then halts the EC CPU (`--no-halt` skips it). `hotplug` doesn't halt unless `--halt`. |
 | `probe [--all]` | Try handshake / strobe / timing variants and rank them by how plausible the chip ID looks. |
 | `regs [--start 00 --end ff]` | Dump DBGR registers through EPP. |
 | `raw "rr 00; aw 01; dr 1"` | Run hand-written EPP ops (`raw help` lists them). |
-| `id [--no-halt]` | Chip ID, flash size, e-flash type. |
+| `id` | Chip ID, flash size, e-flash type. |
 | `read -o FILE [-R BASE[:SIZE]] [-s KB] [--passes N]` | Dump the flash. Checks the address echo afterwards. |
 | `verify [-i FILE] [--ignore BASE[:SIZE]] [-o FILE]` | Read only: check that reads can be trusted before writing. See [Writing the chip](#writing-the-chip). |
 | `write -i FILE [-R BASE[:SIZE]] [--dry-run]` | Back up, then erase and program the sectors that differ from `FILE`. See [Writing the chip](#writing-the-chip). |
@@ -295,7 +296,7 @@ Options for `read`:
 |--------|--------|
 | `--read-reg 08` | Use the alternative burst-read register. |
 | `--chunk N` | Bytes per USB transfer. |
-| `--no-halt` | Don't reset and halt the EC CPU. |
+| `--halt` | Reset and halt the EC CPU first. Only after `enter --mode hotplug`, when nothing halted it since the board was powered; refused if `enter` already did (also on `id`, `verify`, `write`). |
 | `--wdt-disable` | Write the EC watchdog off. |
 | `--reset-gpio` | Reset the EC GPIOs first. |
 | `--ignore-flash-id` | Read even if the e-flash ID isn't recognised. |
@@ -313,9 +314,9 @@ EPP tuning flags work on every command:
 
 ## Writing the chip
 
-> **Tested on the IT5261 (ThinkPad T14s Gen 1):** a 1 KB sector erased, programmed and verified in
-> 0.3 s. A full-image write hasn't been done yet. Make a verified dump first (`read`) and keep it
-> somewhere safe.
+> **Tested on the IT5261 (ThinkPad T14s Gen 1):** 8 data-area sectors erased, programmed and
+> verified in 1.8 s. A full-image write hasn't been done yet. Make a verified dump first (`verify`)
+> and keep it somewhere safe.
 
 **Check the read path first.** `write` trusts its reads three times: the backup, the blank check
 after each erase and the read-back after each sector. Two `read` passes that agree only rule out
@@ -339,47 +340,69 @@ the same way) is that wire or joint. All lines flipping both ways is real conten
 saves the dump as `verify-<chip>-<date>.bin`. That is the flash as it is right now, so use it as
 the source of the test below. Exit code 0 means every check passed, 2 means one didn't.
 
-`write` replaces the EC firmware with the contents of a file:
+`write` replaces the EC firmware with the contents of a file. Do the power-up entry and the write
+in one command:
 
 ```sh
-isp write -i new.bin
+isp --enter powerup write -i new.bin
 ```
 
-What it does, in order:
+### One CPU halt per power cycle
 
-1. Detects the chip, resets and halts the EC CPU, and checks the address echo. It stops if a data
-   bit doesn't answer, or if the e-flash isn't the 8315 type (id `ff ff fe`).
+The halt (DBGR 0x27 ← 0x81) is a CPU reset. On the T14s, a second one sent by a later command let
+the EC firmware run for a moment: it erased a data sector that had just been written and
+verified, and left the e-flash ignoring erase and program until the next power cycle. So only
+`enter` (or `--halt`) halts the CPU, once, and records it in `~/.cache/ite-pp-isp/session.json`.
+`id`, `read`, `verify` and `write` never reset it. `write` refuses to run without that record
+(`--dry-run` only warns). `safe` and `lines` end the session, since they come before unplugging AC.
+
+What `write` does, in order:
+
+1. Checks that the EC CPU was halted in this power cycle, detects the chip and checks the address
+   echo. It stops if a data bit doesn't answer, or if the e-flash isn't the 8315 type
+   (id `ff ff fe`).
 2. Checks the file: it must be a full image (256 KB here), not blank, with the ITE signature
    (a run of `0xA5`) in its first 4 KB. `--force` overrides the content checks, not the size.
 3. Reads the whole flash twice, stops if the reads differ or the address echo fails afterwards,
    and saves it as `backup-<chip>-<date>.bin` (or `--backup FILE`).
-4. Lists the 1 KB sectors that differ from the file. `--dry-run` stops here.
+4. Lists the 1 KB sectors that differ from the file. Without `-R`, the EC data area (0x3B800 to
+   the end on the T14s) is kept as it is: the EC firmware rewrites it while it runs, so a dump
+   only holds a snapshot of it, maybe taken in the middle of an update. `--with-data-area` writes
+   it too. `--dry-run` stops here.
 5. Asks you to type `WRITE` (`--yes` skips the question).
-6. For each sector: erase, check it reads blank, program it word by word, read it back and compare.
-   A failed sector is redone up to 3 times. The sector holding address 0 (reset vector and
-   signature) is written last.
-7. Reads the whole range back and compares it with the file.
+6. Zeroes the protect path (EC 0x20A0–0x20BF) and reads it back.
+7. For each sector: checks the address echo and the protect path (a running EC firmware takes
+   KSO1/KSO2 and sets the protect path again), erases once write enable reads set, checks it reads
+   blank, programs it word by word, reads it back and compares. A failed sector is redone up to
+   3 times, except when the e-flash ignores erase or program (locked) or the cleanup after a
+   sector fails: then it stops at once. The sector holding address 0 (reset vector and signature)
+   is written last.
+8. Reads the whole range back and compares it with the file.
+9. Waits 10 s (`--settle-s`) and reads the written sectors again. A change there means EC code ran.
 
-Afterwards the EC is still halted. Run `isp safe`, unplug AC for a few seconds and plug it back in:
-the EC then boots the new firmware.
+Afterwards the EC is still halted. Run `isp safe`, unplug AC until the EC is drained (pin 21 below
+about 0.5 V) and plug it back in: the EC then boots the new firmware.
 
-**If it fails halfway,** don't unplug anything. The EC stays halted in parallel-port mode, so you
-can run the same command again (only the sectors that still differ are written), or put the backup
-back with `isp write -i backup-….bin`. If the board was unplugged in between, the power-up entry
-still works: it's handled by the chip's hardware, not by the firmware you just wrote.
+**If it fails halfway:**
 
-**A first test that changes nothing:** rewrite sectors with their own contents, from a dump made
-in the same power cycle (the `verify-….bin` file). The EC firmware rewrites its data area
-(0x3B800 to the end on the T14s) while it runs, so an older dump differs there. The flash ends up
-exactly as it was.
+- `WRITE FAILED`: don't unplug anything. The EC stays halted in parallel-port mode, so you can run
+  the same command again (only the sectors that still differ are written), or put the backup back
+  with `isp write -i backup-….bin`.
+- `WRITE STOPPED`, `RECHECK FAILED` or `DATA CHANGED AFTER THE WRITE`: this power cycle can't be
+  trusted any more. Run `isp safe`, unplug AC until the EC is drained, then run the same write with
+  `--enter powerup`. The power-up entry is handled by the chip's hardware, not by the firmware in
+  the flash, so it works even after a partial write.
+
+**A first test that changes nothing:** rewrite a sector with its own contents, from a dump made in
+the same power cycle (the `verify-….bin` file). The flash ends up exactly as it was.
 
 ```sh
-isp write -i verify-05261-….bin -R 3F000:400 --all    # sector with few data bytes
-isp write -i verify-05261-….bin -R 3FC00:400 --all    # erase, program, verify
+isp write -i verify-05261-….bin -R 3FC00:400 --all    # erase, program, verify, recheck
 ```
 
-Both sectors are in the EC's data area, away from the code. Check how many data bytes your fresh
-dump has in them before you pick one.
+That sector is in the EC's data area, away from the code. Never write the data area from a dump
+of an earlier power cycle: on Oct 31 a dump caught the EC firmware in the middle of an update,
+and writing it back left a half-written record that the firmware erased as soon as it ran.
 
 | Option | Effect |
 |--------|--------|
@@ -391,6 +414,9 @@ dump has in them before you pick one.
 | `--force` | Write an image that fails the content checks. |
 | `--keep-protect-path` | Don't zero EC registers 0x20A0–0x20BF first. By default `write` zeroes them, as iteflash does; on the ThinkPad IT5261 the erase is silently ignored without it. |
 | `--word-delay-us N` | Wait after each 2-byte word (default 20). Raised automatically when a sector doesn't read back as written. |
+| `--with-data-area` | Also write the EC data area (T14s: 0x3B800–0x3FFFF). |
+| `--settle-s S` | Seconds to wait before reading the written sectors again (default 10, 0 skips it). |
+| `--halt` | Halt the EC CPU first: only after `enter --mode hotplug`, see above. |
 | `--read-reg 08` | Burst-read register for the backup and the checks. |
 
 `write` never sends chip erase (`0x60`) or status register writes (`0x50`/`0x01`). It uses only

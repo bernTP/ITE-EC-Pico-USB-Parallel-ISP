@@ -50,8 +50,28 @@ class FlashStuck(FlashError):
     """The e-flash stopped answering (reads all FF): retrying won't help."""
 
 
+class FlashLocked(FlashError):
+    """Write enable is accepted but erase / program are ignored."""
+
+
+class FlashStateUnknown(FlashError):
+    """The cleanup after an erase or program (WRDI, follow-mode exit) failed:
+    the e-flash may still be in AAI mode, so nothing more is sent."""
+
+
 STUCK_HINT = ('the e-flash is not answering (reads all ff): erase or program blocked, '
               'or still busy (was --keep-protect-path used?)')
+LOCK_HINT = ('write enable is accepted but the e-flash ignores erase and program: it is '
+             'locked. Seen on an IT5261 after its firmware ran during the session. Nothing '
+             'more is sent; power-cycle with `enter` (AC out) and write again')
+STATE_HINT = ('the e-flash may still be in AAI or follow mode; power-cycle with `enter` '
+              '(AC out) before writing again')
+
+# EC firmware data (settings, logs) that the firmware itself rewrites while it
+# runs, by flash size. A dump only holds a snapshot of it, possibly taken in
+# the middle of an update. Layout of the ThinkPad T14/T14s Gen 1 AMD EC
+# (R1BHT82W): code below 0x3B800, data from there to the end.
+EC_DATA_AREA = {256 * 1024: 0x3B800}
 
 
 class _Regs:
@@ -145,16 +165,43 @@ class EflashWriter:
         self.ref = ref
         self.erase_timeout_s = ERASE_TIMEOUT_S
         self.erase_log = []     # (sector, seconds, [(t, status), ...])
+        self.state_unknown = False
 
     def _close(self, settle_us=0):
         """WRDI and leave follow mode. After an error, settle_us first lets a
         word or erase still in progress finish: the flash ignores WRDI while
-        busy and would stay in AAI mode."""
+        busy and would stay in AAI mode. Returns False if it failed."""
         r = _Regs()
         if settle_us:
             r.status(settle_us)
         r.spi(SPI_CMD_WRITE_DISABLE).status().follow_exit()
-        self.link.run(r.b, check=False)
+        return self.link.run(r.b, check=False).ok
+
+    def _finish(self, ok):
+        """Cleanup after an erase or program. If it fails, the e-flash state is
+        unknown: raised here when nothing else failed, and recorded so that
+        write_sector doesn't retry when something did."""
+        if not self._close(0 if ok else MAX_WORD_DELAY_US):
+            self.state_unknown = True
+            if ok:
+                raise FlashStateUnknown(f'cleanup (WRDI, follow-mode exit) failed: {STATE_HINT}')
+
+    def begin(self):
+        """Start from a known state: WRDI and follow mode off, in case an
+        earlier session was interrupted in the middle of a sector. ECINDDR
+        (0x08) only answers in follow mode, so that comes first."""
+        r = _Regs().follow_enter()
+        r.spi(SPI_CMD_WRITE_DISABLE).status().follow_exit()
+        if not self.link.run(r.b, check=False).ok:
+            self.state_unknown = True
+            raise FlashStateUnknown(f'the EC did not take WRDI / follow-mode exit before '
+                                    f'writing: {STATE_HINT}')
+
+    def _write_enable(self, what):
+        """Follow mode, WREN and RDSR in a batch of their own: the erase or
+        program command is only sent once WEL reads set."""
+        r = _Regs().follow_enter().spi(SPI_CMD_WRITE_ENABLE).status()
+        _check_wel(self.link.run(r.b).data[0], what)
 
     def read(self, addr, size):
         return self.reader.read(addr, size, read_reg=self.read_reg, chunk=size)
@@ -166,12 +213,11 @@ class EflashWriter:
         the e-flash is busy: that counts as busy. Returns the erase time."""
         if addr % SECTOR:
             raise FlashError(f'sector erase at 0x{addr:06X}: not 1 KB aligned')
-        r = _Regs().follow_enter().spi(SPI_CMD_WRITE_ENABLE).status()
-        _addr3(r.spi(SPI_CMD_SECTOR_ERASE_1K), addr).status(ERASE_FIRST_POLL_US)
         ok = False
         try:
-            we, st = self.link.run(r.b).data
-            _check_wel(we, f'erase 0x{addr:06X}')
+            self._write_enable(f'erase 0x{addr:06X}')
+            r = _addr3(_Regs().spi(SPI_CMD_SECTOR_ERASE_1K), addr).status(ERASE_FIRST_POLL_US)
+            st = self.link.run(r.b).data[0]
             t0 = time.time()
             trail = [(0.0, st)]
             while st & STATUS_BUSY:
@@ -188,7 +234,7 @@ class EflashWriter:
             ok = True
             return time.time() - t0
         finally:
-            self._close(0 if ok else MAX_WORD_DELAY_US)
+            self._finish(ok)
 
     def program(self, addr, data):
         """AAI word program of data at addr (both even). The range must be
@@ -200,22 +246,17 @@ class EflashWriter:
             raise FlashError('AAI program needs an even address and length')
         d = self.word_delay_us
         what = f'program 0x{addr:06X}'
-        r = _Regs().follow_enter().spi(SPI_CMD_WRITE_ENABLE).status()
-        _addr3(r.spi(SPI_CMD_WORD_PROGRAM), addr).w(0x08, data[0]).w(0x08, data[1]).status(d)
-        first = True
         ok = False
         try:
+            self._write_enable(what)
+            r = _Regs()
+            _addr3(r.spi(SPI_CMD_WORD_PROGRAM), addr).w(0x08, data[0]).w(0x08, data[1]).status(d)
             for i in range(2, len(data), 2):
                 if (i // 2) % WORDS_PER_BATCH == 0:
-                    out = self.link.run(r.b).data
-                    if first:
-                        _check_wel(out[0], what)
-                        first = False
+                    self.link.run(r.b)
                     r = _Regs()
                 r.spi(SPI_CMD_WORD_PROGRAM).w(0x08, data[i]).w(0x08, data[i + 1]).status(d)
             out = self.link.run(r.spi(SPI_CMD_WRITE_DISABLE).status().b).data
-            if first:
-                _check_wel(out[0], what)
             st, t0 = out[-1], time.time()
             while st & STATUS_BUSY:          # ff counts as busy
                 if time.time() - t0 > LAST_WORD_TIMEOUT_S:
@@ -224,7 +265,7 @@ class EflashWriter:
                 st = self.link.run(Batch().aw(0x08).dr(1)).data[0]
             ok = True
         finally:
-            self._close(0 if ok else MAX_WORD_DELAY_US)
+            self._finish(ok)
 
     def _check_ref(self, sector):
         if not self.ref:
@@ -240,21 +281,30 @@ class EflashWriter:
 
     # ─── One sector, checked ────────────────────────────────────────
     def write_sector(self, addr, data, log=print):
-        """Erase, blank check, program, verify. Retries the whole sector."""
+        """Erase, blank check, program, verify. Retries the whole sector,
+        except when the e-flash ignores the commands (FlashLocked) or its
+        state is unknown."""
+        blank = b'\xFF' * SECTOR
         last = None
+        ignored = 0                 # attempts programmed without a single byte taken
         for attempt in range(1, ATTEMPTS + 1):
             try:
+                before = self.read(addr, SECTOR)
                 self.erase_sector(addr)
                 got = self.read(addr, SECTOR)
-                if got != b'\xFF' * SECTOR:
+                if got != blank:
+                    if got == before:
+                        raise FlashLocked(f'sector 0x{addr:06X}: the erase was ignored '
+                                          f'(sector unchanged): {LOCK_HINT}')
                     raise FlashError(f'sector 0x{addr:06X} not blank after erase '
                                      f'({SECTOR - got.count(0xFF)} bytes left)')
                 self._check_ref(addr)
-                if data != b'\xFF' * SECTOR:
+                if data != blank:
                     self.program(addr, data)
                 got = self.read(addr, SECTOR)
                 if got != data:
-                    bad = [i for i in range(SECTOR) if got[i] != data[i]]
+                    ignored += got == blank
+                    bad =[i for i in range(SECTOR) if got[i] != data[i]]
                     raise VerifyError(f'sector 0x{addr:06X} verify failed: {len(bad)} bytes '
                                       f'differ, first at 0x{addr + bad[0]:06X} (read '
                                       f'{got[bad[0]]:02x}, expected {data[bad[0]]:02x})')
@@ -263,6 +313,8 @@ class EflashWriter:
                 if last:
                     raise FlashStuck(f'{e}\n  (previous attempt: {last})') from e
                 raise
+            except (FlashLocked, FlashStateUnknown):
+                raise
             except VerifyError as e:
                 last = e
                 self.word_delay_us = min(max(self.word_delay_us * 4, 50), MAX_WORD_DELAY_US)
@@ -270,6 +322,13 @@ class EflashWriter:
             except FlashError as e:
                 last = e
                 log(f'  attempt {attempt}: {e}')
+            if self.state_unknown:
+                raise FlashStateUnknown(f'sector 0x{addr:06X}: {last}; then the cleanup '
+                                        f'failed: {STATE_HINT}')
+        if ignored == ATTEMPTS:
+            raise FlashLocked(f'sector 0x{addr:06X}: not a single byte programmed in '
+                              f'{ATTEMPTS} attempts, up to {self.word_delay_us} us per word, '
+                              f'so it is not timing: {LOCK_HINT}')
         raise FlashError(f'sector 0x{addr:06X} failed after {ATTEMPTS} attempts: {last}')
 
 
@@ -307,14 +366,34 @@ def plan(image, current, base, size, rewrite_all=False):
     return out
 
 
-def write_image(writer, image, sectors, progress=None, should_stop=None, log=print):
-    """Write the planned sectors. Stops cleanly between sectors on request."""
+def write_image(writer, image, sectors, progress=None, should_stop=None, log=print,
+                check=None):
+    """Write the planned sectors. Stops cleanly between sectors on request.
+    check(addr) runs before each sector and raises FlashError to stop."""
     for n, addr in enumerate(sectors):
         if should_stop and should_stop():
             raise FlashError(f'stopped by user: {n} of {len(sectors)} sectors written, '
                              f'next was 0x{addr:06X}')
+        if check:
+            check(addr)
         attempts = writer.write_sector(addr, image[addr:addr + SECTOR], log=log)
         if attempts > 1:
             log(f'  sector 0x{addr:06X} OK on attempt {attempts}')
         if progress:
             progress(n + 1, len(sectors))
+
+
+def recheck(writer, image, sectors, settle_s, bus_clean, sleep=None, step_s=0.5):
+    """After a verified write: wait settle_s while watching the bus, then read
+    the written sectors again. Returns those that changed since: only EC code
+    erases or writes behind the tool's back, so its CPU ran."""
+    sleep = sleep or time.sleep
+    waited = 0.0
+    while waited < settle_s:
+        dt = min(step_s, settle_s - waited)
+        sleep(dt)
+        waited += dt
+        if not bus_clean():
+            raise FlashError(f'the bus stopped answering cleanly {waited:.1f}s after the '
+                             'write: EC firmware running again?')
+    return [a for a in sectors if writer.read(a, SECTOR) != image[a:a + SECTOR]]

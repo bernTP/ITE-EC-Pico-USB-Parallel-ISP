@@ -191,7 +191,10 @@ class Dbgr:
         return (0xF00000 | addr16) if self.info.addr_3bytes else addr16
 
     # ─── Chip identification (check_chipid) ─────────────────────────
-    def detect(self, halt=True):
+    def detect(self):
+        """Chip ID and flash size. Never resets or halts the CPU: that is done
+        once per power cycle (halt_on_clean_bus), as a second reset can let
+        the EC firmware run."""
         info = ChipInfo()
         self.info = info
         # before any register write: a stuck bit would send it elsewhere
@@ -216,9 +219,6 @@ class Dbgr:
             # iteflash expects 0x5 in the 3rd byte; an IT5261 reads 52 61 02
             # with 0x00 there, but its size code is at the IT5xxxx address
             elif (cid & 0xF0000) == 0x50000 or (cid & 0xF000) == 0x5000:
-                if halt:
-                    # reset and halt the EC CPU so it stays off the flash
-                    self.write_regs([(REG_CPU, 0x81)])
                 info.it5xxxx = True
                 info.flash_cmd_v2 = True
                 info.addr_3bytes = True
@@ -253,6 +253,15 @@ class Dbgr:
         EC firmware can use to keep DBGR from erasing or programming."""
         for i in range(32):
             self.ec_write(self._ec_addr(0x20A0 + i), 0x00, bank=self.info.addr_3bytes)
+
+    def protect_path(self):
+        """EC 0x20A0..0x20BF, read in one batch: all 0 once disabled. A value
+        that comes back means EC firmware is running and set it again."""
+        b = Batch()
+        for i in range(32):
+            self._mem_select(b, self._ec_addr(0x20A0 + i), self.info.addr_3bytes)
+            b.reg_read(REG_MEM_DATA)
+        return self.link.run(b).data
 
     def reset_gpio(self):
         self.ec_write(self._ec_addr(0x2007), 0x02, bank=self.info.addr_3bytes)

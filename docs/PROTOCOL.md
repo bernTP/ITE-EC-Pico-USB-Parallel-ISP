@@ -105,6 +105,18 @@ checks the echo stays clean for 3 s. If the bits are held at 1, `27` still arriv
 1–2 are 1) and `81` arrives as `87`, which still resets the EC: the tool does that on purpose after
 2 s of a held bus, then halts in the clean window that follows.
 
+**Halt once per power cycle [hw, 2026-11-01].** Every command used to send `27←81` again in its
+chip detection. On the T14s, 8 data-area sectors were written and verified in full; less than
+25 s later, after the next command's `27←81`, sector 0x3EC00 read blank. It had just been written
+with a half-written firmware record (from a dump taken while the firmware was running). Nothing
+the tool sends can erase a sector outside `write`, so EC code ran. From then on the e-flash took
+write enable but ignored erase and program, with the bus clean and the CPU halted again, until
+the next power cycle. Four extra resets earlier the same day, with consistent data, changed
+nothing. Not settled: whether the reset or the seconds between two commands let the firmware
+run, and what the lock is (a register the CPU reset doesn't clear is the likely candidate). The
+tool now halts in `enter` only, records it in a session file, and `write` checks the bus and the
+protect path before each sector and reads the written sectors again 10 s after the write.
+
 The Pico can't detect the power-up by itself: with AC out, its pull-ups charge the unpowered EC
 within ~100 ms, after which the lines it would watch no longer read as clamped.
 
@@ -141,7 +153,7 @@ Registers used (all from iteflash) **[port]**:
 | 0x04..0x07 | ECINDAR0..3 (EC-indirect address) |
 | 0x08 | ECINDDR (EC-indirect data) |
 | 0x09 | selected before burst reads after a fast read (paired with I2C 0x79) |
-| 0x27 | CPU control: 0x81 = reset + halt (done for IT5xxxx) |
+| 0x27 | CPU control: 0x81 = reset + halt (sent once per power cycle, by `enter`) |
 | 0x2E / 0x2F / 0x30 | EC memory address low / high / data (D2EC) |
 | 0x80 | EC memory address bits 23..16 (3-byte addressing parts) |
 
@@ -152,7 +164,9 @@ Detection follows `check_chipid()`:
    `0x5xxxx` is an IT5xxxx part. The IT5261 reads `00` there **[hw]**, so the tool also takes a
    16-bit ID of the form `0x5xxx` as IT5xxxx.
 3. For an IT5xxxx part:
-   - halt the CPU (reg 0x27 = 0x81) **[hw]: works, the bus stays clean afterwards**;
+   - iteflash halts the CPU here (reg 0x27 = 0x81) **[hw]: works, the bus stays clean
+     afterwards**. iteflash does everything in one run; this tool runs one command per process,
+     so it halts once in `enter` instead (see "Halt once per power cycle");
    - read the flash size code at EC 0xF01080 (bits 3..0: 1 = 128 KB, 2 = 256 KB, E = 512 KB,
      F = 1 MB). The IT5261VG-256 reads `02` **[hw]**.
 

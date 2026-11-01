@@ -19,7 +19,8 @@ from itepp.dbgr import BusError, Dbgr               # noqa: E402
 from itepp.flash import FlashError                  # noqa: E402
 from itepp.program import (SECTOR, EflashWriter, FlashStuck, _Regs,  # noqa: E402
                            image_problems, plan, runs, write_image)
-from test_sim import armed_link, image              # noqa: E402
+from itepp.session import Session                   # noqa: E402
+from test_sim import armed_link, clear_session, image  # noqa: E402
 
 READ_PATH_FORBIDDEN = {0x01, 0x02, 0x20, 0x50, 0x60, 0xC7, 0xD8}
 
@@ -63,7 +64,7 @@ class WriterTest(unittest.TestCase):
 
     def link(self, **kw):
         link = armed_link(self.old, size_code=0x02, **kw)
-        Dbgr(link).detect()          # reset + halt, like the CLI does
+        Dbgr(link).detect()          # like the CLI: no reset
         return link
 
     def write(self, link, new, **kw):
@@ -195,6 +196,8 @@ class WriteCliTest(unittest.TestCase):
         self.old = image(256 * 1024)
         self.src = self.path('ec.bin', self.old)
         self.backup = os.path.join(self.tmp.name, 'backup.bin')
+        clear_session()
+        Session(sim=True).save(1)        # as after `enter` in this power cycle
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -209,12 +212,12 @@ class WriteCliTest(unittest.TestCase):
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
             rc = ite_pp_isp.main(['--sim', self.src, '--enter', 'hotplug', 'write',
-                                  '--backup', self.backup] + list(argv))
+                                  '--backup', self.backup, '--settle-s', '0'] + list(argv))
         return rc, out.getvalue(), err.getvalue()
 
     def test_write(self):
         new = self.path('new.bin', changed(self.old, 0, 100, 255))
-        rc, out, err = self.cli('-i', new, '--yes')
+        rc, out, err = self.cli('-i', new, '--yes', '--with-data-area')   # 255: data area
         self.assertEqual(rc, 0, out + err)
         self.assertIn('3 sector(s)', out)
         self.assertIn('Verify OK', out)

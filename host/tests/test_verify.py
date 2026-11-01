@@ -23,7 +23,7 @@ from itepp.flash import Eflash                      # noqa: E402
 from itepp.proto import Batch                       # noqa: E402
 from itepp.sim import SimEC, SimLink                # noqa: E402
 from itepp.verify import bit_report, diff_offsets, verify_read  # noqa: E402
-from test_sim import image                          # noqa: E402
+from test_sim import clear_session, image           # noqa: E402
 
 
 def arm(link):
@@ -161,6 +161,7 @@ class CliTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.flash = image(256 * 1024)
         self.src = self.path('ec.bin', self.flash)
+        clear_session()
 
     def tearDown(self):
         self.tmp.cleanup()

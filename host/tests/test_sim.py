@@ -3,9 +3,11 @@
 Run from host/:  python -m unittest discover -s tests -v
 """
 
+import atexit
 import io
 import os
 import random
+import shutil
 import sys
 import tempfile
 import unittest
@@ -22,7 +24,17 @@ from itepp.epp import EppConfig                     # noqa: E402
 from itepp.flash import Eflash                      # noqa: E402
 from itepp.link import OpError                      # noqa: E402
 from itepp.proto import Batch                       # noqa: E402
+from itepp.session import Session                   # noqa: E402
 from itepp.sim import SimEC, SimLink                # noqa: E402
+
+# the CLI records the halt in a session file: never the user's real one
+SESSION_DIR = tempfile.mkdtemp(prefix='itepp-test-')
+atexit.register(shutil.rmtree, SESSION_DIR, True)
+os.environ['ITEPP_SESSION'] = os.path.join(SESSION_DIR, 'session.json')
+
+
+def clear_session():
+    Session(sim=True).clear()
 
 
 def image(size, seed=1):
@@ -73,7 +85,8 @@ class ChipTest(unittest.TestCase):
         self.assertEqual(info.chip_id, 0x55261)
         self.assertTrue(info.it5xxxx)
         self.assertEqual(info.flash_size, 256 * 1024)
-        self.assertTrue(link.ec.halted)
+        # detect never resets the CPU: `enter` halts it once per power cycle
+        self.assertEqual(link.ec.cpu_resets, 0)
 
     def test_detect_it5261_real_id3(self):
         # the real chip reads 52 61 02 with 0x00 as 3rd ID byte
@@ -82,7 +95,7 @@ class ChipTest(unittest.TestCase):
         self.assertEqual(info.chip_id, 0x05261)
         self.assertTrue(info.it5xxxx)
         self.assertEqual(info.flash_size, 256 * 1024)
-        self.assertTrue(link.ec.halted)
+        self.assertEqual(link.ec.cpu_resets, 0)
 
     def test_bus_check(self):
         link = armed_link(image(1024))
@@ -97,11 +110,6 @@ class ChipTest(unittest.TestCase):
         self.assertIn('PD1 (FFC pin 13) stuck at 1', str(cm.exception))
         self.assertFalse(link.ec.halted)
         self.assertEqual(link.ec.ec_writes, [])
-
-    def test_detect_no_halt(self):
-        link = armed_link(image(256 * 1024))
-        Dbgr(link).detect(halt=False)
-        self.assertFalse(link.ec.halted)
 
     def test_detect_it83xx(self):
         link = armed_link(image(256 * 1024), chip=(0x83, 0x20), ver=0x43)
@@ -245,6 +253,7 @@ class CliTest(unittest.TestCase):
         self.flash = image(256 * 1024)
         with open(self.src, 'wb') as f:
             f.write(self.flash)
+        clear_session()
 
     def tearDown(self):
         self.tmp.cleanup()

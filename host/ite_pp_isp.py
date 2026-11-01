@@ -7,7 +7,8 @@ erases or programs the flash; it backs it up first and asks before writing.
 
 Typical session (AC unplugged at the start):
     ./ite_pp_isp.py hello
-    ./ite_pp_isp.py enter --mode powerup      (asks when to plug AC in)
+    ./ite_pp_isp.py enter --mode powerup      (asks when to plug AC in, halts the
+                                               EC CPU once: nothing after resets it)
     ./ite_pp_isp.py id
     ./ite_pp_isp.py read -o dump.bin --no-exit
     ./ite_pp_isp.py verify -i dump.bin        (can reads be trusted? read only)
@@ -28,10 +29,12 @@ from itepp.dbgr import (Dbgr, BusError, DetectError,      # noqa: E402
 from itepp.dump import ITE_SIGNATURE, analyze, dump        # noqa: E402
 from itepp.epp import EppConfig                            # noqa: E402
 from itepp.flash import EFLASH_TYPE_8315, Eflash, FlashError  # noqa: E402
-from itepp.program import (SECTOR, EflashWriter,           # noqa: E402
-                           image_problems, plan, runs, write_image)
+from itepp.program import (EC_DATA_AREA, SECTOR, EflashWriter,  # noqa: E402
+                           FlashLocked, FlashStateUnknown, image_problems, plan,
+                           recheck, runs, write_image)
 from itepp.link import LinkError, OpError, UsbLink         # noqa: E402
 from itepp.proto import Batch                              # noqa: E402
+from itepp.session import Session                          # noqa: E402
 from itepp.sim import SimEC, SimLink                       # noqa: E402
 from itepp.verify import verify_read                       # noqa: E402
 
@@ -72,9 +75,12 @@ def connect(args):
         print(f'Pico: firmware {info["fw"]}, protocol v{info["proto"]}')
     epp_config(args).apply(link)
     if args.enter != 'none':
-        enter(link, args.enter, interactive=not args.sim,
-              halt=not getattr(args, 'no_halt', False))
+        enter(link, args.enter, interactive=not args.sim, sess=session(args))
     return link
+
+
+def session(args):
+    return Session(sim=bool(args.sim))
 
 
 KSI0_3 = 0x0F << proto.LINE_STB
@@ -88,13 +94,66 @@ def ask(text):
         raise SystemExit('no input: stopped (lines left as they are)')
 
 
-def enter(link, mode, interactive=True, halt=True):
-    """Apply KSI[5,4,2,1] = 0011b so the EC enters DBGR/EPP."""
+def enter(link, mode, interactive=True, halt=None, sess=None):
+    """Apply KSI[5,4,2,1] = 0011b so the EC enters DBGR/EPP. halt: reset and
+    halt the EC CPU once it answers (default: power-up entry only)."""
+    if halt is None:
+        halt = mode == 'powerup'
     if mode == 'hotplug':
         link.run(Batch().strap(proto.STRAP_DRIVE).delay_us(100000))
         print('Strap driven (KSI4/KSI5 low, STB#/AFD#/INIT#/SLIN# high).')
-        return
+    else:
+        if sess:
+            sess.clear()            # a new power cycle: the old halt is gone
+        enter_powerup(link, interactive)
+    if halt:
+        halt_now(link, sess, interactive)
 
+
+def halt_now(link, sess, interactive):
+    """The one reset+halt of a power cycle: stop the EC CPU before its
+    firmware takes KSO1/KSO2 as GPIO, and record it (itepp/session.py)."""
+    state = sess.load() if sess else None
+    if state:
+        raise SystemExit(f'Not halting again: the EC CPU was already halted '
+                         f'{Session.describe(state)}. The halt is a CPU reset, and a second '
+                         'one can let the EC firmware run (on an IT5261 it erased one of its '
+                         'data sectors). Drop --halt; after a power cycle, use `enter`.')
+    n = Dbgr(link).halt_on_clean_bus(stable_s=3.0 if interactive else 0.05)
+    if sess:
+        sess.save(n)
+    print(f'EC CPU reset and halted ({n} halt command(s)): its firmware is stopped, '
+          'so the laptop is (or goes) off. Later commands do not reset it again.')
+
+
+NOT_HALTED = """\
+The EC CPU is not known to be halted in this power cycle{what}. Either:
+  - add --enter powerup before the command: power-up entry and halt, then the
+    command, in one go, or
+  - run `enter` first: it halts the CPU once, and later commands leave it so, or
+  - after `enter --mode hotplug`, add --halt (only if nothing halted the CPU
+    since the board was powered)"""
+
+
+def ensure_halted(link, args, need=False):
+    """Halt the EC CPU only when --halt asks for it, and never twice in a
+    power cycle. need: refuse to go on unless it is known to be halted."""
+    sess = session(args)
+    if getattr(args, 'halt', False):
+        halt_now(link, sess, interactive=not args.sim)
+        return True
+    state = sess.load()
+    if state:
+        print(f'EC CPU halted {Session.describe(state)}: not reset again.')
+        return True
+    if need:
+        raise SystemExit(NOT_HALTED.format(what=', so nothing was written'))
+    print('WARNING: the EC CPU is not known to be halted (no `enter` in this power cycle): '
+          'if its firmware runs, its data area can change while it is read.', file=sys.stderr)
+    return False
+
+
+def enter_powerup(link, interactive):
     # powerup: the EC latches the strap once, at VSTBY power-up, and only from
     # pulls (pulled up = 1, pulled down or floating = 0, driven = unknown).
     # 1. drain: released RP2350 pins leak enough to keep an unpowered EC half
@@ -114,11 +173,6 @@ def enter(link, mode, interactive=True, halt=True):
         ask('Press Enter as soon as AC is in')
     link.run(Batch().strap(proto.STRAP_DRIVE))
     print('Strap now driven.')
-    # 3. stop the EC CPU before its firmware takes KSO1/KSO2 as GPIO
-    if halt:
-        n = Dbgr(link).halt_on_clean_bus(stable_s=3.0 if interactive else 0.05)
-        print(f'EC CPU reset and halted ({n} halt command(s)): its firmware is stopped, '
-              'so the laptop is (or goes) off.')
 
 
 def progress_printer():
@@ -146,18 +200,22 @@ def cmd_hello(link, args):
 def cmd_safe(link, args):
     pull = {'none': proto.PULL_NONE, 'up': proto.PULL_UP, 'down': proto.PULL_DOWN}[args.pull]
     link.run(Batch().safe(pull))
+    session(args).clear()
     print('All lines released (inputs). The strap is no longer applied.')
+    print('Session ended: the next write needs `enter` (power-up entry) again.')
 
 
 def cmd_lines(link, args):
     rows = diag.scan_lines(link, samples=args.samples)
+    session(args).clear()
     print(diag.format_lines(rows))
     print('\nAll lines are released now: run `enter` again before talking to the EC.')
 
 
 def cmd_enter(link, args):
     if args.enter == 'none':
-        enter(link, args.mode, interactive=not args.sim, halt=not args.no_halt)
+        halt = False if args.no_halt else (True if args.halt else None)
+        enter(link, args.mode, interactive=not args.sim, halt=halt, sess=session(args))
     try:
         print(bus_report(*Dbgr(link).check_bus()))
     except OpError as e:
@@ -200,9 +258,10 @@ def cmd_raw(link, args):
 
 
 def detect(link, args):
+    ensure_halted(link, args)
     dbgr = Dbgr(link)
     try:
-        info = dbgr.detect(halt=not args.no_halt)
+        info = dbgr.detect()
     except BusError as e:
         # never continue: register numbers would be corrupted
         raise SystemExit(f'error: {e}')
@@ -350,6 +409,14 @@ halted and stays in parallel-port mode, so you can simply:
     written), or
   - put the old contents back: write -i {backup}"""
 
+RECOVER_POWER_CYCLE = """\
+The flash may now be partly written, and this power cycle can't be trusted
+any more. The power-up entry is handled by the chip's hardware, not by the
+firmware in the flash, so: `safe`, unplug AC until the EC is drained, then
+  - run the same write with --enter powerup (only sectors that still differ
+    are written), or
+  - put the old contents back the same way: --enter powerup write -i {backup}"""
+
 
 def sector_progress():
     t0 = time.time()
@@ -363,13 +430,33 @@ def sector_progress():
     return show
 
 
+def write_range(args, flash_size):
+    """(base, size, data_base): the range to write, and where the EC data
+    area starts if it was left out of it (None otherwise)."""
+    base, size = parse_range(args.range, flash_size)
+    if size <= 0 or base + size > flash_size or base % SECTOR or size % SECTOR:
+        raise SystemExit(f'range 0x{base:X}+0x{size:X}: must be inside the flash and '
+                         f'1 KB aligned (0x{SECTOR:X})')
+    data = EC_DATA_AREA.get(flash_size)
+    if data is None or args.with_data_area:
+        return base, size, None
+    if args.range:
+        if base + size > data:
+            print(f'WARNING: the range reaches into the EC data area (0x{data:06X}-'
+                  f'0x{flash_size - 1:06X}). The EC firmware rewrites it, and a dump of it '
+                  'may hold an update it was in the middle of.')
+        return base, size, None
+    return 0, data, data
+
+
 def cmd_write(link, args):
     with open(args.input, 'rb') as f:
         image = f.read()
 
+    ensure_halted(link, args, need=not args.dry_run)
     dbgr = Dbgr(link)
     try:
-        info = dbgr.detect(halt=True)
+        info = dbgr.detect()
     except DetectError as e:            # BusError included
         raise SystemExit(f'error: {e}\nNothing was written.')
     print(info)
@@ -388,10 +475,7 @@ def cmd_write(link, args):
                          '\nNothing was written (--force writes it anyway).')
     for p in problems:
         print(f'WARNING: {p}')
-    base, size = parse_range(args.range, info.flash_size)
-    if size <= 0 or base + size > info.flash_size or base % SECTOR or size % SECTOR:
-        raise SystemExit(f'range 0x{base:X}+0x{size:X}: must be inside the flash and '
-                         f'1 KB aligned (0x{SECTOR:X})')
+    base, size, data_base = write_range(args, info.flash_size)
 
     print('Reading the current flash twice (backup)...')
     images, diffs = dump(Eflash(link), 0, info.flash_size, passes=2,
@@ -412,6 +496,11 @@ def cmd_write(link, args):
         print('  ' + note)
 
     sectors = plan(image, current, base, size, rewrite_all=args.all)
+    if data_base is not None:
+        kept = plan(image, current, data_base, info.flash_size - data_base)
+        print(f'EC data area 0x{data_base:06X}-0x{info.flash_size - 1:06X} kept as it is'
+              + (f' ({len(kept)} sector(s) of the file differ there; --with-data-area '
+                 'writes them).' if kept else '.'))
     if not sectors:
         print('The flash already holds this image in that range: nothing to write.')
         return 0
@@ -432,7 +521,21 @@ def cmd_write(link, args):
 
     if not args.keep_protect_path:
         dbgr.disable_protect_path()
+        if any(dbgr.protect_path()):
+            raise SystemExit('error: the protect path (EC 0x20A0-0x20BF) does not stay at 0: '
+                             'is the EC firmware running? Nothing was written.')
         print('Protect path disabled (EC 0x20A0-0x20BF = 0).')
+
+    def check(addr):
+        # the EC CPU must still be halted: its firmware takes KSO1/KSO2 and
+        # sets the protect path again when it runs
+        stuck = dbgr.check_bus()
+        if any(stuck):
+            raise FlashStateUnknown(f'before sector 0x{addr:06X}: {bus_report(*stuck)}')
+        if not args.keep_protect_path and any(dbgr.protect_path()):
+            raise FlashLocked(f'before sector 0x{addr:06X}: the protect path is set again, '
+                              'so the EC firmware is running')
+
     stop = []
     old_handler = signal.signal(signal.SIGINT, lambda *_: stop.append(1))
     sig = current.find(ITE_SIGNATURE)
@@ -441,8 +544,13 @@ def cmd_write(link, args):
                           ref=ref)
     print('Writing (Ctrl-C stops cleanly after the current sector)...')
     try:
+        writer.begin()
         write_image(writer, image, sectors, progress=sector_progress(),
-                    should_stop=lambda: bool(stop))
+                    should_stop=lambda: bool(stop), check=check)
+    except (FlashLocked, FlashStateUnknown) as e:
+        print(f'\nWRITE STOPPED: {e}', file=sys.stderr)
+        print(RECOVER_POWER_CYCLE.format(backup=backup), file=sys.stderr)
+        return 3
     except (FlashError, OpError, LinkError) as e:
         print(f'\nWRITE FAILED: {e}', file=sys.stderr)
         print(RECOVER.format(backup=backup), file=sys.stderr)
@@ -460,12 +568,33 @@ def cmd_write(link, args):
         print(RECOVER.format(backup=backup), file=sys.stderr)
         return 3
     print(f'Verify OK. Word delay used: {writer.word_delay_us} us.')
-    print('The EC is still halted. To boot the new firmware: `safe`, unplug AC for a few '
-          'seconds, plug it back in.')
+
+    if args.settle_s > 0:
+        print(f'Checking that the written sectors stay as written ({args.settle_s:g}s, '
+              'no reset)...')
+        try:
+            changed = recheck(writer, image, sectors, args.settle_s, dbgr.bus_clean)
+        except (FlashError, OpError, LinkError) as e:
+            print(f'RECHECK FAILED: {e}', file=sys.stderr)
+            print(RECOVER_POWER_CYCLE.format(backup=backup), file=sys.stderr)
+            return 3
+        if changed:
+            print(f'DATA CHANGED AFTER THE WRITE in {runs(changed)}: something erased or '
+                  'rewrote them after they were verified, and only EC code does that: the '
+                  'EC CPU ran.', file=sys.stderr)
+            print(RECOVER_POWER_CYCLE.format(backup=backup), file=sys.stderr)
+            return 3
+        print('Still as written.')
+    print('The EC is still halted. To boot the new firmware: `safe`, unplug AC until the EC '
+          'is drained (pin 21 below about 0.5 V), plug it back in.')
     return 0
 
 
 # ─── Main ───────────────────────────────────────────────────────────
+
+HALT_HELP = ('reset+halt the EC CPU first: only after `enter --mode hotplug`, when nothing '
+             'halted it since the board was powered (a second reset can let its firmware '
+             'run; refused if `enter` already halted it)')
 
 def build_parser():
     p = argparse.ArgumentParser(
@@ -517,8 +646,12 @@ def build_parser():
     s.add_argument('--mode', choices=['hotplug', 'powerup'], default='powerup',
                    help='powerup (default): AC unplugged first, the tool says when to '
                         'plug it in. hotplug: board already powered')
-    s.add_argument('--no-halt', action='store_true',
+    h = s.add_mutually_exclusive_group()
+    h.add_argument('--no-halt', action='store_true',
                    help="powerup: don't reset+halt the EC CPU once it answers")
+    h.add_argument('--halt', action='store_true',
+                   help='hotplug: reset+halt the EC CPU too (refused if it was already '
+                        'halted in this power cycle)')
     s.set_defaults(func=cmd_enter)
 
     s = sub.add_parser('probe', help='try EPP settings, report which one answers')
@@ -536,8 +669,7 @@ def build_parser():
     s.set_defaults(func=cmd_raw)
 
     s = sub.add_parser('id', help='chip ID, flash size and e-flash type')
-    s.add_argument('--no-halt', action='store_true',
-                   help="don't reset+halt the EC CPU on IT5xxxx")
+    s.add_argument('--halt', action='store_true', help=HALT_HELP)
     s.set_defaults(func=cmd_id)
 
     s = sub.add_parser('read', help='dump the e-flash to a file')
@@ -549,8 +681,7 @@ def build_parser():
     s.add_argument('--read-reg', type=lambda x: int(x, 16), default=0x09, metavar='RR',
                    help='DBGR register for burst reads: 09 (default, like iteflash) or 08')
     s.add_argument('--chunk', type=int, default=4096, help='bytes per USB batch')
-    s.add_argument('--no-halt', action='store_true',
-                   help="don't reset+halt the EC CPU on IT5xxxx")
+    s.add_argument('--halt', action='store_true', help=HALT_HELP)
     s.add_argument('--wdt-disable', action='store_true',
                    help='also write the EC watchdog off (PP mode does it in hardware)')
     s.add_argument('--reset-gpio', action='store_true', help='reset EC GPIOs to default first')
@@ -570,8 +701,7 @@ def build_parser():
                    help='where to save the checked dump (default verify-<chip>-<time>.bin)')
     s.add_argument('--passes', type=int, default=3,
                    help='sequential passes through reg 09 (default 3)')
-    s.add_argument('--no-halt', action='store_true',
-                   help="don't reset+halt the EC CPU on IT5xxxx")
+    s.add_argument('--halt', action='store_true', help=HALT_HELP)
     s.add_argument('--ignore-flash-id', action='store_true',
                    help='check even if the e-flash ID is not recognised')
     s.set_defaults(func=cmd_verify)
@@ -597,6 +727,13 @@ def build_parser():
     s.add_argument('--keep-protect-path', action='store_true',
                    help="don't zero EC 0x20A0-0x20BF first (iteflash and this tool do by "
                         'default; without it the IT5261 ignores erases)')
+    s.add_argument('--with-data-area', action='store_true',
+                   help='also write the EC data area (T14s: 0x3B800-0x3FFFF), which the '
+                        'EC firmware rewrites itself; without -R it is kept as it is')
+    s.add_argument('--settle-s', type=float, default=10, metavar='S',
+                   help='after the final verify, wait S seconds and read the written '
+                        'sectors again (default 10; 0 skips it)')
+    s.add_argument('--halt', action='store_true', help=HALT_HELP)
     s.add_argument('--read-reg', type=lambda x: int(x, 16), default=0x09, metavar='RR',
                    help='DBGR register for burst reads (09 or 08)')
     s.set_defaults(func=cmd_write)

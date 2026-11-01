@@ -55,6 +55,9 @@ class SimEC:
         self.wel = False
         self.aai_addr = None    # next AAI word address while in AAI mode
         self.erased = []        # sector addresses, in erase order
+        self.cpu_resets = 0     # 0x27 writes with the reset bit
+        self.on_reset = None    # on_reset(ec): EC firmware that runs after a reset
+        self.locked = False     # WREN accepted, erase and program ignored
 
     # ─── EPP cycles ─────────────────────────────────────────────────
     def addr_write(self, v):
@@ -80,6 +83,10 @@ class SimEC:
             self.ec_mem[self._mem_addr()] = v
         elif r == 0x27:
             self.halted = bool(v & 0x01)
+            if v & 0x80:
+                self.cpu_resets += 1
+                if self.on_reset:
+                    self.on_reset(self)
         elif r > 0x02:
             self.regs[r] = v
 
@@ -138,6 +145,8 @@ class SimEC:
         elif cmd == 0x04:
             self.wel = False
             self.aai_addr = None
+        elif cmd in (0xD7, 0xAD) and self.locked:
+            pass
         elif cmd == 0xD7 and self.wel and self.erase_blocked:
             self.dead_spi = True
         elif cmd == 0xD7 and self.wel and len(d) >= 3:
@@ -229,6 +238,9 @@ class SimLink(BaseLink):
             return proto.ST_OK, 0xFF if not write else 0
         if self.flags & proto.CFG_SWAP_STROBE:
             addr = not addr
+        if not addr and self.ec.addr == 0x08 and not self.ec._follow():
+            # IT5261: ECINDDR outside follow mode never acknowledges
+            return proto.ST_NWAIT_TIMEOUT, 0
         self.ec.now_us += 1
         if write:
             (self.ec.addr_write if addr else self.ec.data_write)(val | self.stuck)
